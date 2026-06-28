@@ -1,0 +1,45 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+
+# Virtual environments
+venv/
+.venv/
+env/
+.env/
+
+# IDE / Editor
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS files
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Runtime / local saves
+save.json
+*.tmp
+*.bak
+*.sav
+
+# Testing
+.pytest_cache/
+htmlcov/
+.coverage
+*.log
+
+# OMC state
+.omc/
+
+# Claude Code
+.claude/
+
+# Non-project residuals
+incident_alerts_50.json
+incident_parallel_diagnoser.py
