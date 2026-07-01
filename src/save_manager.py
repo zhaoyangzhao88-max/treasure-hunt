@@ -16,10 +16,15 @@ class SaveManager:
     默认存档路径为 `save.json`，可通过构造参数自定义路径。
     """
 
-    def __init__(self, save_path: str = "save.json"):
-        self.save_path = save_path
-        self.backup_path = save_path + ".bak"
-        self.temp_path = save_path + ".tmp"
+    def __init__(self, save_path: str = None, slot_id: int = None):
+        if save_path is not None:
+            self.save_path = save_path
+        elif slot_id is not None:
+            self.save_path = f"save_slot_{slot_id}.json"
+        else:
+            self.save_path = "save.json"
+        self.backup_path = self.save_path + ".bak"
+        self.temp_path = self.save_path + ".tmp"
 
     # =========================================================================
     # 默认数据结构
@@ -37,13 +42,66 @@ class SaveManager:
                 "bag_tier_index": 0,
                 "highest_level_cleared": 0,
                 "total_runs": 0,
+                "total_monsters_slain": 0,
                 "total_gold_earned": 0,
+                "unlocked_badges": [],
             },
             "settings": {
                 "sound_volume": 1.0,
                 "music_volume": 1.0,
             },
+            "leaderboard": [],
         }
+
+    @staticmethod
+    def get_all_slots_summary(max_slots: int = 3) -> list:
+        """扫描所有存档槽位并返回摘要列表。
+
+        每个槽位返回一个 dict：
+            {slot_id, exists, level, gold, total_runs, date}
+        不存在的槽位 exists=False，其余字段为 None。
+
+        单个槽位的扫描异常不会阻断整体，会被吞掉并以 exists=False 兜底。
+
+        Args:
+            max_slots: 扫描的槽位数上限（默认 3）
+
+        Returns:
+            长度等于 max_slots 的摘要字典列表
+        """
+        summary = []
+        for slot_id in range(1, max_slots + 1):
+            entry = {
+                "slot_id": slot_id,
+                "exists": False,
+                "level": None,
+                "gold": None,
+                "total_runs": None,
+                "date": None,
+            }
+            try:
+                mgr = SaveManager(slot_id=slot_id)
+                # 先校验文件是否真实存在，避免 load() 为缺失槽创建默认存档文件
+                if not os.path.exists(mgr.save_path):
+                    summary.append(entry)
+                    continue
+                data = mgr.load()
+                if data and "player" in data:
+                    entry["exists"] = True
+                    player = data["player"]
+                    entry["level"] = player.get("highest_level_cleared", 0)
+                    entry["gold"] = player.get("total_gold_earned", 0)
+                    entry["total_runs"] = player.get("total_runs", 0)
+                    raw_date = data.get("timestamp", 0)
+                    if raw_date:
+                        entry["date"] = time.strftime(
+                            "%Y-%m-%d", time.localtime(raw_date)
+                        )
+            except Exception:
+                # 任何槽扫描失败不阻断整体，保留 exists=False 兜底
+                pass
+            summary.append(entry)
+        return summary
 
     # =========================================================================
     # 校验和计算
@@ -69,39 +127,22 @@ class SaveManager:
     # 安全保存
     # =========================================================================
 
-    def save(self, player_data: dict, settings_data: dict = None) -> bool:
-        """执行安全保存逻辑。
+    def _write_top_level(self, full_data: dict) -> bool:
+        """将已组装好的顶级存档字典原子写入磁盘。
 
-        1. 组装完整数据字典，填入时间戳。
-        2. 计算校验和。
-        3. 备份现有存档（如存在）。
-        4. 写入临时文件 → 原子替换为目标文件。
+        逻辑：填时间戳 → 计算 SHA256 校验和 → 备份现有存档 →
+        写临时文件 → ``os.replace`` 原子替换。
 
         Args:
-            player_data: 玩家数据字典
-            settings_data: 设置数据字典（可选，默认使用默认设置）
+            full_data: 完整顶级存档字典（会就地填入 timestamp 与 checksum）
 
         Returns:
-            True 保存成功
+            True 写入成功
         """
         try:
-            if settings_data is None:
-                settings_data = {
-                    "sound_volume": 1.0,
-                    "music_volume": 1.0,
-                }
-
-            # 组装完整数据
-            payload = {
-                "version": "1.0.0",
-                "timestamp": time.time(),
-                "player": player_data,
-                "settings": settings_data,
-                "checksum": "",  # 占位符，稍后计算
-            }
-
-            # 计算校验和并填入
-            payload["checksum"] = self.calculate_checksum(payload)
+            full_data.setdefault("version", "1.0.0")
+            full_data["timestamp"] = time.time()
+            full_data["checksum"] = self.calculate_checksum(full_data)
 
             # 备份现有存档（如果存在）
             if os.path.exists(self.save_path):
@@ -115,13 +156,80 @@ class SaveManager:
 
             # 原子写入：先写临时文件，再替换
             with open(self.temp_path, "w", encoding="utf-8") as f:
-                json.dump(payload, f, ensure_ascii=False, indent=2)
+                json.dump(full_data, f, ensure_ascii=False, indent=2)
 
             os.replace(self.temp_path, self.save_path)
             return True
-
         except (OSError, ValueError):
             return False
+
+    def save(self, player_data: dict, settings_data: dict = None) -> bool:
+        """执行安全保存逻辑。
+
+        1. 组装完整数据字典。
+        2. 委托 :meth:`_write_top_level` 填入时间戳、计算校验和、备份 + 原子写入。
+
+        Args:
+            player_data: 玩家数据字典
+            settings_data: 设置数据字典（可选，默认使用默认设置）
+
+        Returns:
+            True 保存成功
+        """
+        if settings_data is None:
+            settings_data = {
+                "sound_volume": 1.0,
+                "music_volume": 1.0,
+            }
+        payload = {
+            "version": "1.0.0",
+            "timestamp": 0.0,  # 占位符，_write_top_level 会覆盖
+            "player": player_data,
+            "settings": settings_data,
+            "checksum": "",     # 占位符，_write_top_level 会计算
+        }
+        return self._write_top_level(payload)
+
+    # =========================================================================
+    # 排行榜
+    # =========================================================================
+
+    def add_leaderboard_entry(self, level_reached: int, gold_score: int) -> bool:
+        """把一条新战绩写入本地 Top 5 排行榜。
+
+        读出完整存档，追加新条目，按 gold_score 降序、若同分按 level_reached 降序
+        排序，截断取前 5，重算校验并原子写入。
+
+        Args:
+            level_reached: 单局到达的最高关卡数
+            gold_score: 单局生涯累计金币（终局落盘的分值）
+
+        Returns:
+            True 新条目最终留在 Top 5 内且成功落盘；False 表示落榜或写入失败
+        """
+        data = self.load()
+        entries = list(data.get("leaderboard") or [])
+        new_entry = {
+            "level_reached": int(level_reached),
+            "gold_score": int(gold_score),
+            "date": time.strftime("%Y-%m-%d"),
+        }
+        entries.append(new_entry)
+        entries.sort(key=lambda e: (e["gold_score"], e["level_reached"]), reverse=True)
+        top5 = entries[:5]
+        data["leaderboard"] = top5
+        persisted = self._write_top_level(data)
+        # 稳健的值比较：避免依赖 list.sort()/切片后的对象身份（load() 重建列表时身份会断裂）
+        kept = (
+            any(
+                e["level_reached"] == new_entry["level_reached"]
+                and e["gold_score"] == new_entry["gold_score"]
+                and e["date"] == new_entry["date"]
+                for e in top5
+            )
+            and len(top5) > 0
+        )
+        return bool(persisted and kept)
 
     # =========================================================================
     # 安全加载

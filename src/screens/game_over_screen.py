@@ -294,17 +294,23 @@ class GameOverScreen(BaseScreen):
         Args:
             player: 全局 PlayerState 实例
         """
-        # 1) 保留永久升级属性
+        # 1) 保留永久升级属性 + 生涯统计 + 成就记录
         saved_max_hearts = player.max_hearts
         saved_bag_tier = player.bag_tier_index
+        saved_runs = player.total_runs
+        saved_gold_earned = player.total_gold_earned
+        saved_badges = list(getattr(player, "unlocked_badges", []) or [])
 
         # 2) 全局重置
         player.__init__()
 
-        # 3) 回填永久属性
+        # 3) 回填永久属性 + 生涯统计 + 成就记录（新一局 +1 计入探险次数）
         player.max_hearts = saved_max_hearts
         player.current_hearts = saved_max_hearts
         player.bag_tier_index = saved_bag_tier
+        player.total_runs = saved_runs + 1
+        player.total_gold_earned = saved_gold_earned
+        player.unlocked_badges = saved_badges
 
         # 4) 自动落盘保存
         self.game_manager.save_manager.save(
@@ -313,6 +319,20 @@ class GameOverScreen(BaseScreen):
                 "sound_volume": 1.0,
                 "music_volume": 1.0,
             },
+        )
+
+        # 成就评估（runs 可能解锁 Persistent Pioneer）
+        try:
+            am = self.game_manager.achievement_manager
+            if am is not None:
+                am.check_unlocks()
+        except Exception:
+            pass
+
+        # 5) 彻底死亡（无护身符）：把本局战绩登入本地 Top 5 排行榜
+        self.game_manager.save_manager.add_leaderboard_entry(
+            self.current_level,
+            player.total_gold_earned,
         )
 
     # =========================================================================
@@ -405,10 +425,12 @@ class GameOverScreen(BaseScreen):
             "current_shields": ps.current_shields,
             "bag_tier_index": ps.bag_tier_index,
             "highest_level_cleared": ps.highest_level_cleared,
-            "total_runs": 0,
+            "total_runs": ps.total_runs,
+            "total_monsters_slain": ps.total_monsters_slain,
             "total_gold_earned": ps.total_gold_earned,
             "gold": ps.gold,
             "tools": dict(ps.tools),
             "keys": dict(ps.keys),
             "has_amulet": ps.has_amulet,
+            "unlocked_badges": list(getattr(ps, "unlocked_badges", []) or []),
         }

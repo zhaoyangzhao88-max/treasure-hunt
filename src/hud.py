@@ -106,6 +106,11 @@ class HUD:
         # 尝试加载图标资源（全部包裹在 try-except 中，缺失则保留 None）
         self._load_icons()
 
+        # 工具图标碰撞矩形（宽松点击区，覆盖图标周围区域）
+        self.rect_pickaxe = pygame.Rect(450, 20, 50, 60)   # Pickaxe: X 450-500, Y 20-80
+        self.rect_dynamite = pygame.Rect(510, 20, 50, 60)  # Dynamite: X 510-560, Y 20-80
+        self.rect_map = pygame.Rect(570, 20, 50, 60)       # Map: X 570-620, Y 20-80
+
     @property
     def _player(self):
         """安全获取 PlayerState：绑定时返回绑定值，否则返回降级实例。"""
@@ -154,6 +159,25 @@ class HUD:
         except Exception:
             return None
 
+    def handle_click(self, mouse_pos: tuple) -> str | None:
+        """检测鼠标点击是否命中工具图标区域。
+
+        Args:
+            mouse_pos: (x, y) 屏幕像素坐标（来自 pygame 事件.pos）
+
+        Returns:
+            "pickaxe" / "dynamite" / "map" — 命中对应工具
+            None — 未命中任何工具图标
+        """
+        mx, my = mouse_pos
+        if self.rect_pickaxe.collidepoint(mx, my):
+            return "pickaxe"
+        if self.rect_dynamite.collidepoint(mx, my):
+            return "dynamite"
+        if self.rect_map.collidepoint(mx, my):
+            return "map"
+        return None
+
     # =========================================================================
     # 主渲染入口
     # =========================================================================
@@ -182,6 +206,23 @@ class HUD:
         self._render_tools(surface)
         self._render_keys(surface)
         self._render_weapons_and_buffs(surface)
+
+        # 工具悬停高亮：鼠标在工具图标上且玩家持有该工具时绘制半透明边框
+        try:
+            mouse_x, mouse_y = pygame.mouse.get_pos()
+            hover_rects = [
+                (self.rect_pickaxe, self._player.tools.get("pickaxe", 0)),
+                (self.rect_dynamite, self._player.tools.get("dynamite", 0)),
+                (self.rect_map, self._player.tools.get("map", 0)),
+            ]
+            for rect, count in hover_rects:
+                if count > 0 and rect.collidepoint(mouse_x, mouse_y):
+                    glow_surf = pygame.Surface((rect.width, rect.height), pygame.SRCALPHA)
+                    glow_surf.fill((255, 255, 255, 120))
+                    surface.blit(glow_surf, (rect.x, rect.y))
+                    pygame.draw.rect(surface, (255, 255, 255), rect, 2)
+        except Exception:
+            pass  # headless 下 mouse.get_pos() 可能失败，静默跳过
 
     # =========================================================================
     # 区域 1：生命值与护盾（左侧 X:20-250）

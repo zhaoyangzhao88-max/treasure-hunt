@@ -33,21 +33,34 @@ from src.config import (
     get_biome_for_level,
     BIOME_BGM,
     BIOME_COLORS,
+    TORCH_EXPANSION,
+    TORCH,
 )
 from src.camera import Camera
 from src.level_generator import LevelGenerator
+from src.config import ACTIVE_MUMMY
 from src.interaction_controller import InteractionController
 from src.hud import HUD
 from src.tile_renderer import TileRenderer
 from src.effects import EffectsManager
 from src.animation import Animator, Animation
+from src.lighting_manager import LightingManager
 from src.help_overlay import HelpOverlay
 from src.minimap import Minimap
+from src.pause_overlay import (
+    PauseOverlay,
+    ACTION_RESUME,
+    ACTION_RESTART,
+    ACTION_HELP,
+    ACTION_SAVE_EXIT,
+)
+from src.ai_autopilot import AISolver
 
 # 颜色常量
 _COLOR_BG = (30, 41, 59)           # 地下探险深灰蓝
 _COLOR_AIM = (255, 60, 60, 180)    # 炸药瞄准 — 半透明红色高亮
 _COLOR_DAMAGE_FLASH = (255, 30, 30, 100)  # 受击闪烁半透明红
+_COLOR_AWAKENED = (255, 50, 50)     # 木乃伊苏醒飘字颜色
 
 
 class GameplayScreen(BaseScreen):
@@ -84,8 +97,25 @@ class GameplayScreen(BaseScreen):
         self.show_help: bool = False
         self.help_overlay: HelpOverlay | None = None
 
-        # 实时小地图（默认开启）
+        # 实时小地图（默认关闭，Tab 开启）
+        self.show_minimap: bool = False
         self.minimap: Minimap | None = None
+
+        # 暂停蒙层与关卡初始快照（「重新开始本关」沙盒重置锚点）
+        self.show_paused: bool = False
+        self.pause_overlay: PauseOverlay | None = None
+        self.level_start_player_snapshot: dict | None = None
+        self._saved_input_mode: str = "EXPLORE"
+
+        # AI 自动驾驶（P 键切换）
+        self.autoplay_mode: bool = False
+        self.ai_tick_timer: float = 0.0
+        self.ai_tick_interval: float = 0.25
+
+        # 第 59 课：胜利/死亡路由状态标志（防单帧重复跳转）
+        self.level_completed: bool = False
+        self.is_dead: bool = False
+        self.exit_pos: tuple[int, int] | None = None
 
     # =========================================================================
     # 生命周期
@@ -104,6 +134,12 @@ class GameplayScreen(BaseScreen):
         self.game_manager = GameManager.get_instance()
         self.screen_manager = self.game_manager.screen_manager
 
+        # 第 55 课：火把视野加成管理器（跨关在 on_enter 中按需创建或 reset，
+        # 进入奖励关时保持实例不置 None，回来仍走 reset 清 0）
+        if not hasattr(self, "lighting_manager") or self.lighting_manager is None:
+            self.lighting_manager = LightingManager()
+        self.lighting_manager.reset()
+
         data_payload = data_payload or {}
 
         # 初始化瓦片渲染器（统一管理 Spritesheet 切片与退化渲染）
@@ -115,6 +151,8 @@ class GameplayScreen(BaseScreen):
         # 初始化特效管理器
         self.effects_manager = EffectsManager()
         self.damage_flash_timer = 0.0
+        self.shield_flash_timer = 0.0
+        self.clover_spark_timer = 0.0
 
         # 初始化玩法指南蒙层
         self.help_overlay = HelpOverlay()
@@ -133,12 +171,29 @@ class GameplayScreen(BaseScreen):
                 start_x=s["player_x"],
                 start_y=s["player_y"],
             )
+            # AI 自动驾驶求解器（恢复分支）
+            self.autoplay_mode = False
+            self.ai_tick_timer = 0.0
+            self.ai_solver = AISolver(
+                self.game_map,
+                self.game_manager.player_state,
+                self.interaction_controller,
+            )
+            # 对接活性木乃伊（恢复分支）
+            self.interaction_controller.link_active_mummies_from_map()
             self.hud = HUD(self.game_manager.player_state)
             self.input_mode = "EXPLORE"
             self.camera = Camera()
             self.camera.offset_x = s["camera_offset_x"]
             self.camera.offset_y = s["camera_offset_y"]
             self.game_manager.suspended_level_state = None
+            self.shield_flash_timer = 0.0
+            self.clover_spark_timer = 0.0
+
+            # ---- 第 55 课：恢复分支的 lighting_manager 状态保留 ----
+            # torch_expansion 在奖励关期间依旧有效，不在此处 reset（主关进入时已统一 reset）
+            if not hasattr(self, "lighting_manager") or self.lighting_manager is None:
+                self.lighting_manager = LightingManager()
 
             # ---- 初始化玩法指南蒙层 ----
             self.help_overlay = HelpOverlay()
@@ -147,9 +202,20 @@ class GameplayScreen(BaseScreen):
             # ---- 初始化小地图（恢复分支） ----
             self.minimap = Minimap(
                 self.game_map,
-                self.interaction_controller.player_x,
-                self.interaction_controller.player_y,
+                self.game_manager.player_state,
             )
+
+            # 第 59 课：在恢复分支中从地图扫描 LOCK_EXIT 作为出口坐标
+            self.exit_pos = None
+            for _y in range(self.game_map.height):
+                for _x in range(self.game_map.width):
+                    if self.game_map.layer1[_y][_x] == "LOCK_EXIT":
+                        self.exit_pos = (_x, _y)
+                        break
+                if self.exit_pos is not None:
+                    break
+            self.level_completed = False
+            self.is_dead = False
 
             # ---- 计算地貌并配置渲染器与 BGM ----
             biome = get_biome_for_level(self.current_level_num)
@@ -159,16 +225,48 @@ class GameplayScreen(BaseScreen):
             AudioManager.get_instance().play_bgm(BIOME_BGM[biome])
             return
 
-        # 解析关卡编号
-        continue_game = data_payload.get("continue", False)
-        highest_cleared = data_payload.get("highest_level_cleared", 0)
+        # ------------------------------------------------------------------
+        # 第 54 课：外部自定义关卡路由（优先于程序化生成）
+        # ------------------------------------------------------------------
+        custom_map_path = data_payload.get("custom_map_path")
+        _custom_loaded = False
+        start_pos: tuple[int, int] | None = None
+        exit_pos: tuple[int, int] | None = None
 
-        if continue_game and highest_cleared > 0:
-            self.current_level_num = highest_cleared
-        else:
-            self.current_level_num = 1
+        if custom_map_path:
+            from src.asset_manager import get_resource_path
+            from src.custom_level_loader import CustomLevelLoader, MalformedMapError
 
-        # 计算地貌并配置渲染器
+            full_path = get_resource_path(custom_map_path)
+            try:
+                loader = CustomLevelLoader()
+                self.game_map, start_pos, exit_pos = loader.load_from_json(full_path)
+                self.current_level_num = 999  # 自制关专属编号
+                _custom_loaded = True
+            except (
+                MalformedMapError,
+                FileNotFoundError,
+                OSError,
+                UnicodeDecodeError,
+            ) as exc:
+                # 恶劣降级：绝不卡死——回退到 level 1 程序化生成
+                print(
+                    f"[CRITICAL] 自定义地图加载失败，降级到程序化生成："
+                    f"{type(exc).__name__}: {exc}"
+                )
+                # 后续 Standard 路径会重新计算 current_level_num 与 game_map。
+
+        if not _custom_loaded:
+            # 解析关卡编号
+            continue_game = data_payload.get("continue", False)
+            highest_cleared = data_payload.get("highest_level_cleared", 0)
+
+            if continue_game and highest_cleared > 0:
+                self.current_level_num = highest_cleared
+            else:
+                self.current_level_num = 1
+
+        # 计算地貌并配置渲染器（level_num=999 会落入 VOLCANO 兜底）
         current_biome = get_biome_for_level(self.current_level_num)
         self.current_biome = current_biome
         self.tile_renderer.set_biome(current_biome)
@@ -178,9 +276,15 @@ class GameplayScreen(BaseScreen):
         if self.game_manager.player_state is not None:
             self.game_manager.player_state.purge_temporary_items()
 
-        # 生成关卡
-        generator = LevelGenerator(seed=self.current_level_num)
-        self.game_map, start_pos, exit_pos = generator.generate_level(self.current_level_num)
+        # 生成关卡（仅当外部自定义关卡未成功加载时）
+        if not _custom_loaded:
+            generator = LevelGenerator(seed=self.current_level_num)
+            self.game_map, start_pos, exit_pos = generator.generate_level(self.current_level_num)
+
+        # 第 59 课：保存出口坐标供胜利判定使用
+        self.exit_pos = exit_pos
+        self.level_completed = False
+        self.is_dead = False
 
         # 计算地图像素尺寸
         self.map_width_px = self.game_map.width * TILE_SIZE
@@ -194,8 +298,23 @@ class GameplayScreen(BaseScreen):
             start_y=start_pos[1],
         )
 
+        # AI 自动驾驶求解器（正常分支）
+        self.autoplay_mode = False
+        self.ai_tick_timer = 0.0
+        self.ai_solver = AISolver(
+            self.game_map,
+            self.game_manager.player_state,
+            self.interaction_controller,
+        )
+
         # 初始化 HUD 状态栏
         self.hud = HUD(self.game_manager.player_state)
+
+        # 对接活性木乃伊：扫描地图 layer2 中的 ACTIVE_MUMMY，创建对应实例
+        self.interaction_controller.link_active_mummies_from_map()
+
+        # 第 50 课：对接周期地刺 —— 扫描 layer2 中的 SPIKE_TRAP 并实例化
+        self.interaction_controller.link_spike_traps_from_map()
 
         # 输入模式："EXPLORE"（默认探索）/ "DYNAMITE"（炸药瞄准）
         self.input_mode = "EXPLORE"
@@ -220,9 +339,16 @@ class GameplayScreen(BaseScreen):
         # ---- 初始化小地图 ----
         self.minimap = Minimap(
             self.game_map,
-            self.interaction_controller.player_x,
-            self.interaction_controller.player_y,
+            self.game_manager.player_state,
         )
+
+        # 仅首次进入本关时打下玩家快照（resume 分支已在前面 return，
+        # 再次进入本关的 resume / 重载绝不重复打快照，保持锚点稳定）
+        if not data_payload or not data_payload.get("resume", False):
+            if self.game_manager.player_state is not None:
+                self.level_start_player_snapshot = (
+                    self.game_manager.player_state.get_snapshot()
+                )
 
     def on_exit(self):
         """离开探索场景时释放引用。"""
@@ -235,7 +361,13 @@ class GameplayScreen(BaseScreen):
         self.hud = None
         self.player_animator = None
         self.effects_manager = None
+        self.show_minimap = False
         self.minimap = None
+        self.show_paused = False
+        self.pause_overlay = None
+        self.level_start_player_snapshot = None
+        self.autoplay_mode = False
+        self.ai_solver = None
 
     # =========================================================================
     # 玩家动画状态机
@@ -294,11 +426,49 @@ class GameplayScreen(BaseScreen):
     # =========================================================================
 
     def handle_event(self, event: pygame.event.Event):
-        """分发输入事件：键盘移动 + 鼠标点击。"""
-        # ── H / F1 切换帮助蒙层（最高优先级）──────────────
+        """分发输入事件：键盘移动 + 鼠标点击 + 暂停蒙层交互。
+
+        优先级链：ESC 切暂停（最高）→ 暂停态输入冻结 → H/F1 切帮助 →
+        帮助态冻结 → 原有 gameplay 输入分发
+        """
+        # ── ESC 切换暂停蒙层（最高优先级）────────────────────
+        if event.type == pygame.KEYDOWN and event.key == pygame.K_ESCAPE:
+            if self.show_help:
+                # 帮助开启时 ESC 先关闭帮助（与 H/F1 切换语义一致）
+                self.show_help = False
+                try:
+                    if self.game_manager and self.game_manager.asset_manager:
+                        self.game_manager.asset_manager.play_sound("ui_close")
+                except Exception:
+                    pass
+                return
+            self._toggle_pause()
+            return
+
+        # ── 暂停态：冻结一切 gameplay 输入 ──────────────────
+        if self.show_paused:
+            # 仅分发 MOUSEMOTION 给按钮推进悬停
+            if event.type == pygame.MOUSEMOTION and self.pause_overlay is not None:
+                try:
+                    if self.game_manager and self.game_manager.asset_manager:
+                        if self.pause_overlay.update(event.pos):
+                            self.game_manager.asset_manager.play_sound("ui_hover")
+                except Exception:
+                    self.pause_overlay.update(event.pos)
+                return
+            # 鼠标左键释放：派发给按钮命中测试
+            if event.type == pygame.MOUSEBUTTONUP and event.button == 1:
+                if self.pause_overlay is not None:
+                    action = self.pause_overlay.button_action_at(event.pos)
+                    if action:
+                        self._dispatch_pause_action(action)
+                return
+            # 其它全部拦截（WASD / 鼠标点击格网 / Tab / B / M 全部忽略）
+            return
+
+        # ── H / F1 切换帮助蒙层 ──────────────────────────────
         if event.type == pygame.KEYDOWN and event.key in (pygame.K_h, pygame.K_F1):
             self.show_help = not self.show_help
-            # 轻微弹窗音效（退化静默）
             try:
                 if self.game_manager is not None and self.game_manager.asset_manager is not None:
                     self.game_manager.asset_manager.play_sound("ui_open")
@@ -309,25 +479,40 @@ class GameplayScreen(BaseScreen):
         if self.show_help:
             return
 
+        # ── P 切换自动驾驶 ──────────────────────────────
+        if event.type == pygame.KEYDOWN and event.key == pygame.K_p:
+            if not self.show_paused:
+                self.autoplay_mode = not self.autoplay_mode
+                try:
+                    if self.game_manager and self.game_manager.asset_manager:
+                        self.game_manager.asset_manager.play_sound(
+                            "ui_open" if self.autoplay_mode else "ui_close")
+                except Exception:
+                    pass
+            return
+
         if event.type == pygame.KEYDOWN:
             self._handle_keydown(event)
         elif event.type == pygame.MOUSEBUTTONDOWN:
             self._handle_mouse_click(event)
+        elif event.type == pygame.MOUSEWHEEL:
+            self._handle_scroll_wheel(event)
 
     def _handle_keydown(self, event: pygame.event.Event):
         """处理方向键 / WASD 移动 + 主动工具快捷键。"""
         if self.interaction_controller is None or self.game_map is None:
             return
-
-        # ── 主动工具快捷键拦截 ──────────────────────────────
-        if event.key == pygame.K_ESCAPE:
-            self.input_mode = "EXPLORE"
+        # 自动驾驶接管：冻结 WASD / B / M 等 gameplay 键（Tab 在 handle_event 上层已处理）
+        if self.autoplay_mode:
             return
 
         # ── Tab 切换小地图 ────────────────────────────────
         if event.key == pygame.K_TAB:
-            if self.minimap is not None:
-                self.minimap.toggle()
+            # 帮助蒙层开启时，强制关闭小地图
+            if self.show_help:
+                self.show_minimap = False
+            else:
+                self.show_minimap = not self.show_minimap
             return
 
         if event.key in (pygame.K_b, pygame.K_2):
@@ -396,6 +581,25 @@ class GameplayScreen(BaseScreen):
         """处理鼠标点击：根据 input_mode 分发左键行为。"""
         if self.camera is None or self.interaction_controller is None or self.game_map is None:
             return
+        # 自动驾驶接管：屏蔽鼠标点击开掘 / 标雷 / HUD 工具
+        if self.autoplay_mode:
+            return
+
+        # 小地图开启时，临时屏蔽鼠标点击开掘，防点击出图意外
+        if self.show_minimap:
+            return
+
+        # ── HUD 区域点击拦截 ──────────────────────────────────
+        if event.pos[1] < HUD_HEIGHT and self.hud is not None:
+            tool_hit = self.hud.handle_click(event.pos)
+            if tool_hit == "dynamite":
+                # 切换炸药瞄准模式（仅当玩家有炸药时）
+                if self.interaction_controller.player.tools.get("dynamite", 0) > 0:
+                    self.input_mode = "DYNAMITE" if self.input_mode != "DYNAMITE" else "EXPLORE"
+            elif tool_hit == "map":
+                self.interaction_controller.use_map()
+            # 无论是否命中工具，只要点击在 HUD 区域就拦截（不传递到网格）
+            return
 
         grid_x, grid_y = self.camera.screen_to_grid(event.pos[0], event.pos[1])
         if grid_x == -1 and grid_y == -1:
@@ -425,6 +629,21 @@ class GameplayScreen(BaseScreen):
                         else:
                             self.game_manager.asset_manager.play_sound("player_hurt")
                             # 怪物受击联动
+                            self._trigger_damage_effect(grid_x, grid_y)
+                        return
+
+                # 若点击相邻活性木乃伊，触发消灭判定
+                if entity == "ACTIVE_MUMMY":
+                    px = self.interaction_controller.player_x
+                    py = self.interaction_controller.player_y
+                    if max(abs(grid_x - px), abs(grid_y - py)) <= 1:
+                        result = self.interaction_controller.attack_active_mummy(
+                            grid_x, grid_y
+                        )
+                        if result:
+                            self.game_manager.asset_manager.play_sound("attack")
+                        else:
+                            self.game_manager.asset_manager.play_sound("player_hurt")
                             self._trigger_damage_effect(grid_x, grid_y)
                         return
 
@@ -458,7 +677,7 @@ class GameplayScreen(BaseScreen):
 
                     if has_trap:
                         # 陷阱受击联动（含 HURT 动画）
-                        self._trigger_damage_effect(grid_x, grid_y)
+                        self._trigger_damage_effect(grid_x, grid_y, had_shields=prev_shields)
                     else:
                         # 开掘动画
                         if self.player_animator:
@@ -474,6 +693,169 @@ class GameplayScreen(BaseScreen):
         elif event.button == 3:
             # 右键：插/拔红旗（任何模式下均可用）
             self.interaction_controller.toggle_flag(grid_x, grid_y)
+
+    def _handle_scroll_wheel(self, event: pygame.event.Event):
+        """处理鼠标滚轮事件：上下滚动循环切换 EXPLORE ↔ DYNAMITE 模式。
+
+        仅在玩家持有炸药时切换，无炸药时忽略滚轮。
+        """
+        if self.interaction_controller is None:
+            return
+        if self.interaction_controller.player.tools.get("dynamite", 0) <= 0:
+            return
+        # 双向切换：EXPLORE → DYNAMITE → EXPLORE
+        self.input_mode = "DYNAMITE" if self.input_mode != "DYNAMITE" else "EXPLORE"
+
+    # =========================================================================
+    # 暂停菜单与时停重置路由
+    # =========================================================================
+
+    def _toggle_pause(self):
+        """切换暂停态：进入暂停时保存并冻结状态，恢复时还原。
+
+        进入暂停会强制把 input_mode 压到 EXPLORE、关闭帮助蒙层，
+        并通过 _saved_input_mode 记录原先的模式以便恢复。
+        """
+        self.show_paused = not self.show_paused
+        if self.show_paused:
+            # 进入暂停：保存当前状态
+            self._saved_input_mode = self.input_mode
+            self.input_mode = "EXPLORE"
+            self.show_help = False
+            if self.pause_overlay is None:
+                self.pause_overlay = PauseOverlay()
+            try:
+                if self.game_manager and self.game_manager.asset_manager:
+                    self.game_manager.asset_manager.play_sound("pause_open")
+            except Exception:
+                pass
+        else:
+            # 恢复：还原先前保存的模式
+            self.input_mode = getattr(self, "_saved_input_mode", "EXPLORE")
+            try:
+                if self.game_manager and self.game_manager.asset_manager:
+                    self.game_manager.asset_manager.play_sound("pause_close")
+            except Exception:
+                pass
+
+    def _dispatch_pause_action(self, action: str):
+        """暂停按钮路由分发（供 handle_event 与单元测试直接调用）。
+
+        Args:
+            action: ACTION_RESUME / ACTION_RESTART / ACTION_HELP / ACTION_SAVE_EXIT
+        """
+        if action == ACTION_RESUME:
+            self._toggle_pause()                       # show_paused → False
+        elif action == ACTION_RESTART:
+            self._restart_level()
+        elif action == ACTION_HELP:
+            self.show_paused = False
+            self.input_mode = getattr(self, "_saved_input_mode", "EXPLORE")
+            self.show_help = True
+        elif action == ACTION_SAVE_EXIT:
+            self._save_and_exit()
+
+    def _restart_level(self):
+        """安全重装本关：还原玩家快照 + 重生成地图 + 重连控制器 + 摄像机对齐。
+
+        这套「时光倒流」机制利用 on_enter 时打下的 level_start_player_snapshot，
+        让玩家局内消耗品/状态精确还原，并重新生成一张全新可解的地图，
+        实现关卡沙盒级别的安全重置。
+        """
+        if self.game_manager is None or self.game_map is None:
+            return
+
+        # 1) 还原玩家快照
+        if self.level_start_player_snapshot is not None:
+            self.game_manager.player_state.load_snapshot(
+                self.level_start_player_snapshot
+            )
+
+        # 2) 重生成全新可解地图（真随机种子，避免与旧地图相同）
+        generator = LevelGenerator(seed=None)
+        self.game_map, start_pos, exit_pos = generator.generate_level(self.current_level_num)
+        self.exit_pos = exit_pos
+        self.level_completed = False
+        self.is_dead = False
+
+        # 3) 重连 InteractionController 并定位到 start_pos
+        self.map_width_px = self.game_map.width * TILE_SIZE
+        self.map_height_px = self.game_map.height * TILE_SIZE
+        self.interaction_controller = InteractionController(
+            self.game_map,
+            self.game_manager.player_state,
+            start_x=start_pos[0],
+            start_y=start_pos[1],
+        )
+        self.interaction_controller.link_active_mummies_from_map()
+
+        # 4) 摄像机对齐新起点（同 on_enter 的 snap 逻辑）
+        player_px_x = start_pos[0] * TILE_SIZE + TILE_SIZE // 2
+        player_px_y = start_pos[1] * TILE_SIZE + TILE_SIZE // 2
+        self.camera.offset_x = player_px_x - SCREEN_WIDTH / 2
+        self.camera.offset_y = player_px_y - HUD_HEIGHT - (SCREEN_HEIGHT - HUD_HEIGHT) / 2
+        max_x = max(0, self.map_width_px - SCREEN_WIDTH)
+        max_y = max(0, self.map_height_px - (SCREEN_HEIGHT - HUD_HEIGHT))
+        self.camera.offset_x = max(0, min(self.camera.offset_x, max_x))
+        self.camera.offset_y = max(0, min(self.camera.offset_y, max_y))
+
+        # 5) 特效池清屏 + 重置各闪屏计时器 + 重建 HUD/Minimap + 退出暂停
+        if self.effects_manager is not None:
+            self.effects_manager.clear()
+        self.input_mode = "EXPLORE"
+        self.damage_flash_timer = 0.0
+        self.shield_flash_timer = 0.0
+        self.clover_spark_timer = 0.0
+        self.hud = HUD(self.game_manager.player_state)
+        self.minimap = Minimap(
+            self.game_map,
+            self.game_manager.player_state,
+        )
+        self.show_paused = False
+
+        # 6) 播放关卡重置音效（退化静默）
+        try:
+            from src.audio_manager import AudioManager
+            AudioManager.get_instance().play_sfx("level_reset")
+        except Exception:
+            pass
+
+    def _save_and_exit(self):
+        """安全持久化落盘并切回主菜单。
+
+        构造与 GameManager._hydrate_player 同键名体系的 player 字典，
+        交给 SaveManager.save 原子写入，再切回主菜单。任一环节出错均静默降级，
+        确保玩家不会卡在探索场景。
+        """
+        if self.game_manager is None:
+            return
+
+        ps = self.game_manager.player_state
+        player_dict = {
+            "max_hearts": ps.max_hearts,
+            "current_hearts": ps.current_hearts,
+            "max_shields": ps.max_shields,
+            "current_shields": ps.current_shields,
+            "bag_tier_index": ps.bag_tier_index,
+            "highest_level_cleared": ps.highest_level_cleared,
+            "total_runs": ps.total_runs,
+            "total_monsters_slain": ps.total_monsters_slain,
+            "total_gold_earned": ps.total_gold_earned,
+            "gold": ps.gold,
+            "tools": dict(ps.tools),
+            "keys": dict(ps.keys),
+            "has_amulet": ps.has_amulet,
+            "arrows": ps.arrows,
+            "has_machete": ps.has_machete,
+            "has_clover": ps.has_clover,
+        }
+        settings_dict = getattr(self.game_manager, "settings_data", None)
+        try:
+            self.game_manager.save_manager.save(player_dict, settings_dict)
+        except Exception:
+            pass
+
+        self.game_manager.screen_manager.switch_screen(GameState.MAIN_MENU)
 
     # =========================================================================
     # Game Juice 联动特效
@@ -497,37 +879,43 @@ class GameplayScreen(BaseScreen):
             center_x, center_y - 30, "BOOM!", (255, 215, 0), font_size=28
         )
 
-    def _trigger_damage_effect(self, grid_x: int, grid_y: int):
-        """受击联动：HURT 动画 + 红幕闪屏 + 震颤 + 溅血粒子 + 伤害文字。"""
+    def _trigger_damage_effect(self, grid_x: int, grid_y: int, had_shields: int = None):
+        """受击联动：根据受击前是否有护盾，触发截然不同的视效分支。
+
+        Args:
+            grid_x, grid_y: 触发伤害的网格坐标。
+            had_shields: 受击前的护盾数量（由调用方传入 prev_shields）。
+                          为 None 时回退到当前护盾判定（向后兼容）。
+        """
         # 受击动画
         if self.player_animator:
             self.player_animator.play("HURT")
 
-        p = self.interaction_controller.player
         tile_world_x = grid_x * TILE_SIZE + TILE_SIZE // 2
         tile_world_y = grid_y * TILE_SIZE + TILE_SIZE // 2
 
-        # 受击红幕闪烁
-        self.damage_flash_timer = 0.25
-
-        # 屏幕震颤（0.2s，5px 振幅）
-        self.camera.trigger_shake(0.2, 5.0)
-
-        # 深红色溅血粒子
-        self.effects_manager.spawn_particles(
-            tile_world_x, tile_world_y, (180, 20, 20), count=12
+        # 判定：优先使用传入的 had_shields，否则回退到当前值
+        shield_was_active = had_shields if had_shields is not None else (
+            self.interaction_controller.player.current_shields > 0
         )
 
-        # 伤害文字
-        hearts_lost = p.current_hearts  # 简化：触发时血量已是扣减后
-        # 实际应以 shields 变化为主
-        if p.current_shields == 0:
+        if shield_was_active:
+            # ── 护盾抵挡路径：青色闪屏 + 碎片爆发 + 护盾飘字 ──
+            self.shield_flash_timer = 0.2
+            self.camera.trigger_shake(0.2, 5.0)
+            self.effects_manager.spawn_shield_shatter(tile_world_x, tile_world_y, count=20)
             self.effects_manager.spawn_text(
-                tile_world_x, tile_world_y - 20, "-1 Heart", (255, 60, 60), font_size=22
+                tile_world_x, tile_world_y - 20, "-1 Shield", (0, 240, 255), font_size=22
             )
         else:
+            # ── 血肉受伤路径：红色闪屏 + 溅血粒子 + 血量飘字 ──
+            self.damage_flash_timer = 0.25
+            self.camera.trigger_shake(0.2, 5.0)
+            self.effects_manager.spawn_particles(
+                tile_world_x, tile_world_y, (180, 20, 20), count=12
+            )
             self.effects_manager.spawn_text(
-                tile_world_x, tile_world_y - 20, "-1 Shield", (60, 120, 255), font_size=22
+                tile_world_x, tile_world_y - 20, "-1 Heart", (255, 60, 60), font_size=22
             )
 
     def _trigger_collection_effect(self, grid_x: int, grid_y: int, entity: str):
@@ -554,12 +942,118 @@ class GameplayScreen(BaseScreen):
             "MACHETE": ("Machete!", (30, 160, 50)),
             "CHEST": ("Treasure!", (255, 215, 0)),
             "STAIRS": ("Stairs!", (200, 180, 30)),
+            "TORCH": ("+1.5 Light Radius!", (255, 140, 0)),
         }
+
+        # 第 55 课：火把拾取 —— 累加视野加成 + 橙红火苗粒子 + 浮动文字
+        if entity == "TORCH" and self.lighting_manager is not None:
+            self.lighting_manager.torch_expansion += TORCH_EXPANSION
+            cx = grid_x * TILE_SIZE + TILE_SIZE // 2
+            cy = grid_y * TILE_SIZE + TILE_SIZE // 2
+            self.effects_manager.spawn_particles(
+                cx, cy, (255, 120, 0), count=18)
+            self.effects_manager.spawn_text(
+                cx, cy - TILE_SIZE // 2,
+                "+1.5 Light Radius!", (255, 160, 30), font_size=20)
+            # 实体销毁已在 interaction_controller._collect_entity 中完成
+            return
 
         entry = collection_map.get(entity)
         if entry:
             text, color = entry
             self.effects_manager.spawn_text(world_x, text_y_offset, text, color, font_size=20)
+
+    # =========================================================================
+    # AI 自动驾驶 — 动作分发器
+    # =========================================================================
+
+    def _execute_ai_action(self, action):
+        """将 AISolver 返回的三元组翻译为实际控制器调用。
+
+        Args:
+            action: (action_type, (tx, ty)|None, extra_data|None)
+        """
+        if not action or action[0] == "NO_OP":
+            return
+        action_type, target, extra = action
+        ctrl = self.interaction_controller
+        if ctrl is None or self.game_map is None:
+            return
+        if target is not None and not self.game_map.is_in_bounds(target[0], target[1]):
+            return
+
+        if action_type == "FLAG":
+            ctrl.toggle_flag(target[0], target[1])
+        elif action_type == "UNCOVER":
+            ctrl.uncover_tile(target[0], target[1])
+        elif action_type == "MOVE":
+            ctrl.move_player(target[0], target[1])
+        elif action_type == "USE_TOOL":
+            ctrl.interact_with_adjacent_obstacle(target[0], target[1])
+
+    # =========================================================================
+    # 第 59 课：胜利 / 死亡判定触发器
+    # =========================================================================
+
+    def check_victory_condition(self) -> None:
+        """检测玩家是否抵达已解锁的出口并触发 LEVEL_COMPLETE 跳转。
+
+        条件：
+        - 玩家坐标 (px, py) == self.exit_pos
+        - 出口处的障碍已被清除（layer1 == "NONE"，原 LOCK_EXIT 已被钥匙移除）
+
+        触发后设置 level_completed = True 防止单帧重复跳转。
+        """
+        if self.level_completed or self.is_dead:
+            return
+        if self.game_manager is None or self.game_manager.player_state is None:
+            return
+        if self.game_map is None or self.interaction_controller is None:
+            return
+        if self.exit_pos is None:
+            return
+
+        px = self.interaction_controller.player_x
+        py = self.interaction_controller.player_y
+
+        if (px, py) != self.exit_pos:
+            return
+
+        # 二次校验：出口障碍已被钥匙清除
+        if self.game_map.layer1[py][px] != "NONE":
+            return
+
+        self.level_completed = True
+        payload = {
+            "completed_level": self.current_level_num,
+            "gold_earned": self.game_manager.player_state.gold,
+            "remaining_hearts": self.game_manager.player_state.current_hearts,
+            "remaining_shields": self.game_manager.player_state.current_shields,
+        }
+        self.game_manager.screen_manager.switch_screen(
+            GameState.LEVEL_COMPLETE, payload
+        )
+
+    def check_death_condition(self) -> None:
+        """检测玩家生命值归零并触发 GAME_OVER 跳转。
+
+        条件：
+        - player_state.current_hearts <= 0
+
+        触发后设置 is_dead = True 防止单帧重复跳转。
+        先于 check_victory_condition 调用，确保死亡优先。
+        """
+        if self.level_completed or self.is_dead:
+            return
+        if self.game_manager is None or self.game_manager.player_state is None:
+            return
+
+        if self.game_manager.player_state.current_hearts <= 0:
+            self.is_dead = True
+            self.game_manager.screen_manager.switch_screen(
+                GameState.GAME_OVER,
+                {"current_level": self.current_level_num}
+            )
 
     # =========================================================================
     # 帧循环
@@ -572,6 +1066,18 @@ class GameplayScreen(BaseScreen):
             self.player_animator.update(dt)
 
         if self.camera is None or self.interaction_controller is None:
+            return
+
+        # 暂停态：冻结 gameplay 逻辑（玩家移动、特效、闪烁、摄像机随动全部时停），
+        # 仅推进按钮悬停状态。必须在 show_help 冻结之前，保证暂停比帮助优先。
+        if self.show_paused:
+            if self.pause_overlay is not None:
+                try:
+                    if self.game_manager and self.game_manager.asset_manager:
+                        if self.pause_overlay.update(pygame.mouse.get_pos()):
+                            self.game_manager.asset_manager.play_sound("ui_hover")
+                except Exception:
+                    self.pause_overlay.update(pygame.mouse.get_pos())
             return
 
         # 帮助蒙层开启时 冻结逻辑更新（玩家移动、特效、闪烁、摄像机随动全部时停）
@@ -599,9 +1105,58 @@ class GameplayScreen(BaseScreen):
         if self.effects_manager is not None:
             self.effects_manager.update(dt)
 
+        # 活性木乃伊：无敌窗口衰减 + 苏醒飘字
+        ctrl = self.interaction_controller
+        if ctrl is not None:
+            ctrl.tick_invincible(dt)
+            # 检测刚苏醒的木乃伊 → 飘字 "Awakened!" + 屏闪
+            for m in ctrl.active_mummies:
+                if m.state == "CHASE" and not getattr(m, "_awakened_marked", False):
+                    m._awakened_marked = True
+                    mx = m.x * TILE_SIZE + TILE_SIZE // 2
+                    my = m.y * TILE_SIZE + TILE_SIZE // 2
+                    self.effects_manager.spawn_text(
+                        mx, my - TILE_SIZE // 2, "Awakened!", _COLOR_AWAKENED, font_size=28
+                    )
+                    self.camera.trigger_shake(0.2, 4.0)
+
+        # AI 自动驾驶 tick（每 0.25s 决策一次）
+        if (self.autoplay_mode and self.ai_solver is not None
+                and not self.show_paused and not self.show_help
+                and self.interaction_controller is not None
+                and self.game_map is not None):
+            self.ai_tick_timer += dt
+            if self.ai_tick_timer >= self.ai_tick_interval:
+                self.ai_tick_timer -= self.ai_tick_interval
+                ctrl = self.interaction_controller
+                action = self.ai_solver.think_next_action(
+                    ctrl.player_x, ctrl.player_y)
+                self._execute_ai_action(action)
+
         # 受击闪烁计时衰减
         if self.damage_flash_timer > 0:
             self.damage_flash_timer = max(0.0, self.damage_flash_timer - dt)
+
+        # 护盾碎裂青色屏闪衰减
+        if self.shield_flash_timer > 0:
+            self.shield_flash_timer = max(0.0, self.shield_flash_timer - dt)
+
+        # 四叶草绿芒轨迹定时喷吐（每 0.08s 一次）
+        if (self.game_manager is not None
+                and self.game_manager.player_state is not None
+                and self.game_manager.player_state.has_clover):
+            self.clover_spark_timer += dt
+            while self.clover_spark_timer >= 0.08:
+                self.clover_spark_timer -= 0.08
+                px = self.interaction_controller.player_x
+                py = self.interaction_controller.player_y
+                sx = px * TILE_SIZE + TILE_SIZE // 2
+                sy = py * TILE_SIZE + TILE_SIZE  # 脚底位置
+                self.effects_manager.spawn_clover_spark(sx, sy)
+
+        # 第 59 课：死亡判定优先于胜利判定
+        self.check_death_condition()
+        self.check_victory_condition()
 
     def render(self, surface: pygame.Surface):
         """画面绘制 — 地图瓦片 → 特效 → HUD → 受击闪幕。"""
@@ -647,28 +1202,75 @@ class GameplayScreen(BaseScreen):
         if self.input_mode == "DYNAMITE":
             self._draw_aim_cursor(surface, render_offset_x, render_offset_y)
 
-        # 5) 受击闪烁遮罩
+        # 5) 受击闪烁遮罩（红色血肉受伤 / 青色护盾抵挡 / 木乃伊撞击屏闪）
         if self.damage_flash_timer > 0:
             flash_surf = pygame.Surface((SCREEN_WIDTH, SCREEN_HEIGHT - HUD_HEIGHT),
                                          pygame.SRCALPHA)
             flash_surf.fill(_COLOR_DAMAGE_FLASH)
             surface.blit(flash_surf, (0, HUD_HEIGHT))
 
+        # 活性木乃伊撞击屏闪（控制器 screen_flash_duration 控制的短时闪屏）
+        ctrl = self.interaction_controller
+        if (ctrl is not None and ctrl.screen_flash_color is not None
+                and ctrl.screen_flash_duration > 0):
+            flash_surf = pygame.Surface((SCREEN_WIDTH, SCREEN_HEIGHT - HUD_HEIGHT),
+                                         pygame.SRCALPHA)
+            intensity = min(255, int(ctrl.screen_flash_duration / 0.15 * 80))
+            flash_surf.fill((*ctrl.screen_flash_color, intensity))
+            surface.blit(flash_surf, (0, HUD_HEIGHT))
+        if self.shield_flash_timer > 0:
+            shield_surf = pygame.Surface((SCREEN_WIDTH, SCREEN_HEIGHT - HUD_HEIGHT),
+                                          pygame.SRCALPHA)
+            shield_alpha = int(self.shield_flash_timer / 0.2 * 80)
+            shield_surf.fill((0, 240, 255, min(120, shield_alpha)))
+            surface.blit(shield_surf, (0, HUD_HEIGHT))
+
         # 6) 绘制 HUD 数据状态栏（最顶层）
         if self.hud is not None:
             self.hud.render(surface, self.current_level_num)
 
-        # 7) 绘制小地图（HUD 之上、帮助蒙层之下）
-        if self.minimap is not None and self.minimap.visible:
-            self.minimap.render(surface, self.camera)
+        # 6.5) 自动驾驶状态指示（闪烁文字，左下角）
+        if self.autoplay_mode and self.player_animator is not None:
+            blink_on = (int(self.player_animator.state_time * 4) % 2) == 0
+            if blink_on:
+                try:
+                    _ai_font = pygame.font.SysFont(None, 28)
+                    _dot = _ai_font.render("●", True, (255, 230, 80))
+                    _text = _ai_font.render(
+                        " AUTO-PILOT ACTIVE", True, (255, 230, 80))
+                    _x, _y = 16, SCREEN_HEIGHT - 28
+                    surface.blit(_dot, (_x, _y))
+                    surface.blit(_text, (_x + _dot.get_width() + 2, _y))
+                except Exception:
+                    pass
 
-        # 8) 玩法指南蒙层（最最顶层 — 覆盖一切，含小地图区域）
+        # 7) 绘制小地图（HUD 之上、帮助蒙层之下）— 半透明叠加
+        if (self.show_minimap and self.minimap is not None
+                and self.interaction_controller is not None
+                and self.player_animator is not None):
+            self.minimap.render(
+                surface,
+                self.interaction_controller.player_x,
+                self.interaction_controller.player_y,
+                self.player_animator.state_time,
+            )
+
+        # 8) 玩法指南蒙层（HUD 之上）
         if self.show_help and self.help_overlay is not None:
             self.help_overlay.render(surface)
 
+        # 9) 暂停蒙层（最最顶层 — 覆盖 HUD / 小地图 / 帮助蒙层）
+        if self.show_paused and self.pause_overlay is not None:
+            self.pause_overlay.render(surface)
+
     def _render_tile(self, surface: pygame.Surface, col: int, row: int,
                      render_offset_x: float, render_offset_y: float):
-        """使用 TileRenderer 绘制单个瓦片（分层叠加）。"""
+        """使用 TileRenderer 绘制单个瓦片（分层叠加）。
+
+        第 55 课起叠加战争迷雾：根据该瓦片相对玩家的实时光照强度，
+        在最后渲染阶段覆盖对应的半透明黑色遮罩（alpha ∈ (0,255)），
+        使视野外一片漆黑、半影区线性淡出。
+        """
         # 计算屏幕坐标（左上角像素）— 使用含震颤的渲染偏移
         screen_x = col * TILE_SIZE - int(render_offset_x)
         screen_y = row * TILE_SIZE - int(render_offset_y) + HUD_HEIGHT
@@ -682,6 +1284,15 @@ class GameplayScreen(BaseScreen):
         obstacle = self.game_map.layer1[row][col]
         entity = self.game_map.layer2[row][col]
 
+        # 第 55 课：计算该瓦片相对玩家的实时光照强度（0.0 ~ 1.0）
+        light_intensity = 1.0
+        if self.lighting_manager is not None and self.interaction_controller is not None:
+            px = self.interaction_controller.player_x
+            py = self.interaction_controller.player_y
+            sight_radius = self.lighting_manager.get_sight_radius(self.current_biome)
+            light_intensity = self.lighting_manager.calculate_tile_lighting(
+                col, row, px, py, sight_radius)
+
         # 1) 绘制地形层（DIRT / UNCOVERED）
         extra_info = None
         if terrain == "UNCOVERED":
@@ -689,19 +1300,23 @@ class GameplayScreen(BaseScreen):
             if trap_count > 0:
                 extra_info = str(trap_count)
         self.tile_renderer.draw_tile(surface, terrain, screen_x, screen_y,
-                                     extra_info=extra_info)
+                                     extra_info=extra_info,
+                                     light_intensity=light_intensity)
 
         # 2) 障碍物层覆盖
         if obstacle != "NONE":
-            self.tile_renderer.draw_tile(surface, obstacle, screen_x, screen_y)
+            self.tile_renderer.draw_tile(surface, obstacle, screen_x, screen_y,
+                                         light_intensity=light_intensity)
 
         # 3) 实体道具层覆盖
         if entity != "NONE":
-            self.tile_renderer.draw_tile(surface, entity, screen_x, screen_y)
+            self.tile_renderer.draw_tile(surface, entity, screen_x, screen_y,
+                                         light_intensity=light_intensity)
 
         # 4) 红旗覆盖
         if self.game_map.flags[row][col]:
-            self.tile_renderer.draw_tile(surface, "FLAG", screen_x, screen_y)
+            self.tile_renderer.draw_tile(surface, "FLAG", screen_x, screen_y,
+                                         light_intensity=light_intensity)
 
     def _render_player(self, surface: pygame.Surface,
                        render_offset_x: float, render_offset_y: float):
@@ -719,9 +1334,12 @@ class GameplayScreen(BaseScreen):
         # 仅当玩家在可见区域时绘制
         if (screen_x + TILE_SIZE >= 0 and screen_x <= SCREEN_WIDTH
                 and screen_y + TILE_SIZE >= HUD_HEIGHT and screen_y <= SCREEN_HEIGHT):
+            extra = {"animator": self.player_animator}
+            if self.game_manager is not None:
+                extra["player_state"] = self.game_manager.player_state
             self.tile_renderer.draw_tile(
                 surface, "PLAYER", screen_x, screen_y,
-                extra_info=self.player_animator,
+                extra_info=extra,
             )
 
     def _draw_aim_cursor(self, surface: pygame.Surface,

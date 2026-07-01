@@ -304,23 +304,31 @@ def test_input_mode_switch_to_dynamite():
 
 
 def test_input_mode_escape_resets():
-    """测试 ESC 键重置回 EXPLORE 模式。"""
+    """测试 ESC 键切换暂停菜单（ESC 已升级为暂停触发器）。
+
+    原 DYNAMITE 取消语义已迁移到暂停态机制：进入暂停时 input_mode
+    强制压为 EXPLORE 并通过 _saved_input_mode 记录先前模式，恢复时原样还原。
+    """
     if not pygame.get_init():
         pygame.init()
 
     screen = _make_screen()
-    screen.game_manager.player_state.add_tool("dynamite", 1)
 
-    # 进入 DYNAMITE 模式
-    screen.input_mode = "DYNAMITE"
+    # 默认应未暂停
+    assert screen.show_paused is False
 
     # 模拟 ESC
     event = pygame.event.Event(pygame.KEYDOWN, {"key": pygame.K_ESCAPE})
     screen.handle_event(event)
 
-    assert screen.input_mode == "EXPLORE", (
-        f"ESC 后 input_mode 应为 EXPLORE，得到 {screen.input_mode}"
-    )
+    # 应进入暂停态
+    assert screen.show_paused is True, "ESC 后应进入暂停态"
+    # ESC 进入暂停时 input_mode 被强制设为 EXPLORE 与 _saved_input_mode 机制
+    assert screen.input_mode == "EXPLORE"
+
+    # 再按一次 ESC 退出暂停
+    screen.handle_event(pygame.event.Event(pygame.KEYDOWN, {"key": pygame.K_ESCAPE}))
+    assert screen.show_paused is False
 
     print("[PASS] test_input_mode_escape_resets")
 

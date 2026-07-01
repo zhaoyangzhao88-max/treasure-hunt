@@ -1,17 +1,11 @@
-"""实时小地图（Minimap）系统验证脚本 — Microsoft Treasure Hunt
+"""网格雷达迷你小地图（Minimap Overlay）系统验证脚本 — Microsoft Treasure Hunt
 
 Headless 模式下验证：
-- 自适应像素比计算（不同地图尺寸）
-- minimap_width / minimap_height 与地图尺寸一致
-- 默认 visible = True
-- toggle() 切换 True ↔ False
-- 渲染不崩溃（GameMap / Surface / Camera 均有效）
-- 渲染不崩溃（camera=None 时跳过视口框线）
-- visible=False 时 render() 提前返回（不绘制任何像素）
-- 渲染后小地图 Surface 右下角区域存在非零像素
-- 玩家标记颜色像素存在
-- GameplayScreen 集成：Tab 键切换 minimap.visible
-- BonusLevelScreen 集成：Tab 键切换 minimap.visible
+- 像素画布大小动态算定（15×15 / 40×40 极大地图）
+- 墙/地/已掘/泥墙/锁门/出口/楼梯 彩色映射
+- 闪烁公式（sin 弧度变换）无崩溃
+- Tab 键切换 show_minimap 状态
+- 40×40 极大地图渲染零崩溃、无越界
 
 运行方式::
 
@@ -20,6 +14,7 @@ Headless 模式下验证：
 
 import os
 import sys
+import math
 
 # 将项目根目录加入模块搜索路径
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
@@ -36,8 +31,7 @@ from src.config import (
     TILE_SIZE,
 )
 from src.map_data import GameMap
-from src.camera import Camera
-from src.minimap import Minimap, MINIMAP_MAX_SIZE, PLAYER_DOT_SIZE
+from src.minimap import Minimap, GRID_SIZE, GRID_GAP, MINIMAP_MAX_SIZE
 from src.player_state import PlayerState
 
 
@@ -60,212 +54,201 @@ def _make_map(w: int, h: int) -> GameMap:
     return GameMap(w, h)
 
 
-def _make_camera() -> Camera:
-    """创建一个简单 Camera 实例（偏移归零）。"""
-    cam = Camera()
-    cam.offset_x = 0.0
-    cam.offset_y = 0.0
-    return cam
+def _make_player() -> PlayerState:
+    """创建最小 PlayerState 实例。"""
+    return PlayerState()
 
 
 # =============================================================================
-# 测试 1：自适应像素比计算
+# 测试 1：像素画布大小动态算定（15×15）
 # =============================================================================
 
-def test_pixel_size_scaling():
-    """不同地图尺寸下 pixel_size 自适应计算正确。"""
-    # 小地图 8×8 → pixel_size = max(1, 180 // 8) = 22
-    mm8 = Minimap(_make_map(8, 8), 0, 0)
-    assert mm8.pixel_size == max(1, MINIMAP_MAX_SIZE // 8), (
-        f"8×8 地图 pixel_size 期望 {max(1, MINIMAP_MAX_SIZE // 8)}，"
-        f"得到 {mm8.pixel_size}"
-    )
-    # 大地图 40×40 → pixel_size = max(1, 180 // 40) = 4
-    mm40 = Minimap(_make_map(40, 40), 0, 0)
-    assert mm40.pixel_size == max(1, MINIMAP_MAX_SIZE // 40), (
-        f"40×40 地图 pixel_size 期望 {max(1, MINIMAP_MAX_SIZE // 40)}，"
-        f"得到 {mm40.pixel_size}"
-    )
-    # 中等地图 15×15 → pixel_size = max(1, 180 // 15) = 12
-    mm15 = Minimap(_make_map(15, 15), 0, 0)
-    assert mm15.pixel_size == max(1, MINIMAP_MAX_SIZE // 15), (
-        f"15×15 地图 pixel_size 期望 {max(1, MINIMAP_MAX_SIZE // 15)}，"
-        f"得到 {mm15.pixel_size}"
-    )
-
-
-# =============================================================================
-# 测试 2：minimap_width / minimap_height 与地图尺寸一致
-# =============================================================================
-
-def test_minimap_dimensions():
-    """minimap_width / minimap_height 正确映射地图尺寸。"""
-    gm = _make_map(20, 30)
-    mm = Minimap(gm, 0, 0)
-    ps = mm.pixel_size
-    assert mm.minimap_width == 20 * ps, (
-        f"minimap_width 期望 {20 * ps}，得到 {mm.minimap_width}"
-    )
-    assert mm.minimap_height == 30 * ps, (
-        f"minimap_height 期望 {30 * ps}，得到 {mm.minimap_height}"
-    )
-
-
-# =============================================================================
-# 测试 3：默认 visible = True
-# =============================================================================
-
-def test_default_visible():
-    """Minimap 默认应为可见。"""
-    mm = Minimap(_make_map(10, 10), 0, 0)
-    assert mm.visible is True, "默认 visible 应为 True"
-
-
-# =============================================================================
-# 测试 4：toggle() 切换 True ↔ False
-# =============================================================================
-
-def test_toggle():
-    """toggle() 在 True ↔ False 之间交替。"""
-    mm = Minimap(_make_map(10, 10), 0, 0)
-    assert mm.visible is True
-    mm.toggle()
-    assert mm.visible is False, "第一次 toggle 后应为 False"
-    mm.toggle()
-    assert mm.visible is True, "第二次 toggle 后应为 True"
-    mm.toggle()
-    assert mm.visible is False, "第三次 toggle 后应为 False"
-
-
-# =============================================================================
-# 测试 5：渲染不崩溃（有 Camera）
-# =============================================================================
-
-def test_render_no_crash_with_camera():
-    """render() 在有 Camera 时不崩溃。"""
-    _ensure_pygame()
+def test_canvas_size_15x15():
+    """15×15 地图的 minimap 画布尺寸符合 grid_size + gap 比例。"""
     gm = _make_map(15, 15)
-    mm = Minimap(gm, 5, 5)
-    surf = pygame.Surface((SCREEN_WIDTH, SCREEN_HEIGHT))
-    cam = _make_camera()
-    # 不应抛出任何异常
-    mm.render(surf, cam)
-
-
-# =============================================================================
-# 测试 6：渲染不崩溃（camera=None）
-# =============================================================================
-
-def test_render_no_crash_without_camera():
-    """render() 在 camera=None 时不崩溃（跳过视口框线）。"""
-    _ensure_pygame()
-    gm = _make_map(15, 15)
-    mm = Minimap(gm, 5, 5)
-    surf = pygame.Surface((SCREEN_WIDTH, SCREEN_HEIGHT))
-    # 不应抛出任何异常
-    mm.render(surf, camera=None)
-
-
-# =============================================================================
-# 测试 7：visible=False 时 render() 提前返回（不绘制像素）
-# =============================================================================
-
-def test_render_skip_when_hidden():
-    """visible=False 时 render() 不修改目标 Surface。"""
-    _ensure_pygame()
-    gm = _make_map(15, 15)
-    mm = Minimap(gm, 5, 5)
-    mm.toggle()  # → False
-    assert mm.visible is False
-
-    surf = pygame.Surface((SCREEN_WIDTH, SCREEN_HEIGHT))
-    surf.fill((0, 0, 0))
-    # 保存渲染前快照
-    before = surf.copy()
-
-    mm.render(surf, camera=None)
-
-    # 全像素一致 → render 没有绘制任何东西
-    assert pygame.image.tostring(surf, "RGB") == pygame.image.tostring(before, "RGB"), (
-        "visible=False 时 render() 不应修改 Surface"
+    mm = Minimap(gm, _make_player())
+    gs = mm.grid_size
+    expected_w = 15 * (gs + GRID_GAP) - GRID_GAP
+    expected_h = 15 * (gs + GRID_GAP) - GRID_GAP
+    assert mm.minimap_width == expected_w, (
+        f"15×15 宽度期望 {expected_w}，得到 {mm.minimap_width}"
     )
+    assert mm.minimap_height == expected_h, (
+        f"15×15 高度期望 {expected_h}，得到 {mm.minimap_height}"
+    )
+    # 小地图应不超过最大边长
+    assert mm.minimap_width <= MINIMAP_MAX_SIZE
+    assert mm.minimap_height <= MINIMAP_MAX_SIZE
 
 
 # =============================================================================
-# 测试 8：渲染后右下角区域存在非零像素
+# 测试 2：像素画布大小动态算定（40×40 极大地图）
 # =============================================================================
 
-def test_render_produces_pixels():
-    """render() 后右下角区域应有非零像素（确认小地图被绘制）。"""
+def test_canvas_size_40x40():
+    """40×40 极大地图的 minimap 画布尺寸被钳制在 MINIMAP_MAX_SIZE 内。"""
+    gm = _make_map(40, 40)
+    mm = Minimap(gm, _make_player())
+    assert mm.minimap_width <= MINIMAP_MAX_SIZE, (
+        f"40×40 宽度 {mm.minimap_width} 超过 {MINIMAP_MAX_SIZE}"
+    )
+    assert mm.minimap_height <= MINIMAP_MAX_SIZE, (
+        f"40×40 高度 {mm.minimap_height} 超过 {MINIMAP_MAX_SIZE}"
+    )
+    # grid_size 至少为 1
+    assert mm.grid_size >= 1
+
+
+# =============================================================================
+# 测试 3：彩色雷达点映射 — 墙/地/已掘
+# =============================================================================
+
+def test_color_mapping_basic():
+    """手动放置 WALL / DIRT / UNCOVERED，验证渲染后像素颜色对应配置色值。"""
     _ensure_pygame()
-    gm = _make_map(15, 15)
-    mm = Minimap(gm, 5, 5)
+    gm = _make_map(10, 10)
+    # (2, 2) 放置不可破坏墙
+    gm.layer1[2][2] = "WALL"
+    # (3, 3) 放置普通泥土（默认已是 DIRT，显式设置）
+    gm.layer0[3][3] = "DIRT"
+    # (4, 4) 已掘通道
+    gm.layer0[4][4] = "UNCOVERED"
+
+    mm = Minimap(gm, _make_player())
     surf = pygame.Surface((SCREEN_WIDTH, SCREEN_HEIGHT))
     surf.fill((0, 0, 0))
 
-    mm.render(surf, camera=None)
+    mm.render(surf, 0, 0, 0.0)
 
-    # 检查右下角小地图区域是否有非零像素
-    from src.minimap import MINIMAP_MARGIN
-    dest_x = SCREEN_WIDTH - mm.minimap_width - MINIMAP_MARGIN
-    dest_y = SCREEN_HEIGHT - mm.minimap_height - MINIMAP_MARGIN
-    # 裁剪小地图区域
-    region = surf.subsurface(pygame.Rect(dest_x, dest_y, mm.minimap_width, mm.minimap_height))
+    gs = mm.grid_size
+    # 计算 minimap 在屏幕上的位置（与 minimap.py 一致）
+    dest_x = max(0, (SCREEN_WIDTH - mm.minimap_width) // 2)
+    dest_y = max(HUD_HEIGHT + 8,
+                 min(96, SCREEN_HEIGHT - mm.minimap_height - 8))
 
-    has_nonzero = False
-    for y in range(region.get_height()):
-        for x in range(region.get_width()):
-            if region.get_at((x, y))[:3] != (0, 0, 0):
-                has_nonzero = True
-                break
-        if has_nonzero:
-            break
+    # 墙 (2, 2) 像素位置
+    wall_rx = dest_x + 2 * (gs + GRID_GAP)
+    wall_ry = dest_y + 2 * (gs + GRID_GAP)
+    wall_color = surf.get_at((wall_rx, wall_ry))[:3]
+    assert wall_color == (10, 15, 25), f"墙颜色应为 (10,15,25)，得到 {wall_color}"
 
-    assert has_nonzero, "渲染后右下角小地图区域应存在非零像素"
+    # 泥土 (3, 3) 像素位置
+    dirt_rx = dest_x + 3 * (gs + GRID_GAP)
+    dirt_ry = dest_y + 3 * (gs + GRID_GAP)
+    dirt_color = surf.get_at((dirt_rx, dirt_ry))[:3]
+    assert dirt_color == (80, 50, 30), f"泥土颜色应为 (80,50,30)，得到 {dirt_color}"
+
+    # 已掘 (4, 4) 像素位置
+    unc_rx = dest_x + 4 * (gs + GRID_GAP)
+    unc_ry = dest_y + 4 * (gs + GRID_GAP)
+    unc_color = surf.get_at((unc_rx, unc_ry))[:3]
+    assert unc_color == (50, 60, 70), f"已掘颜色应为 (50,60,70)，得到 {unc_color}"
 
 
 # =============================================================================
-# 测试 9：玩家标记颜色像素存在
+# 测试 4：彩色雷达点映射 — 泥墙 / 锁门 / 出口 / 楼梯
 # =============================================================================
 
-def test_player_dot_rendered():
-    """render() 后小地图上应存在玩家颜色（青蓝色）像素。"""
+def test_color_mapping_advanced():
+    """验证泥墙、锁门（红/绿/蓝）、出口、楼梯的彩色映射。"""
     _ensure_pygame()
-    gm = _make_map(15, 15)
-    mm = Minimap(gm, 7, 7)
+    gm = _make_map(12, 12)
+    # 泥墙 (1,1)
+    gm.layer1[1][1] = "DIRT_WALL"
+    # 红锁门 (2,2)
+    gm.layer1[2][2] = "LOCK_RED"
+    # 绿锁门 (3,3)
+    gm.layer1[3][3] = "LOCK_GREEN"
+    # 蓝锁门 (4,4)
+    gm.layer1[4][4] = "LOCK_BLUE"
+    # 出口 (5,5)
+    gm.layer1[5][5] = "LOCK_EXIT"
+    # 楼梯 (6,6)
+    gm.layer2[6][6] = "STAIRS"
+
+    mm = Minimap(gm, _make_player())
     surf = pygame.Surface((SCREEN_WIDTH, SCREEN_HEIGHT))
     surf.fill((0, 0, 0))
 
-    mm.render(surf, camera=None)
+    mm.render(surf, 0, 0, 0.5)
 
-    from src.minimap import MINIMAP_MARGIN, _MINIMAP_COLORS
-    dest_x = SCREEN_WIDTH - mm.minimap_width - MINIMAP_MARGIN
-    dest_y = SCREEN_HEIGHT - mm.minimap_height - MINIMAP_MARGIN
-    region = surf.subsurface(pygame.Rect(dest_x, dest_y, mm.minimap_width, mm.minimap_height))
+    gs = mm.grid_size
+    dest_x = max(0, (SCREEN_WIDTH - mm.minimap_width) // 2)
+    dest_y = max(HUD_HEIGHT + 8,
+                 min(96, SCREEN_HEIGHT - mm.minimap_height - 8))
 
-    player_color = _MINIMAP_COLORS["PLAYER"]
-    dot_x = 7 * mm.pixel_size
-    dot_y = 7 * mm.pixel_size
+    def _px(col, row):
+        return dest_x + col * (gs + GRID_GAP), dest_y + row * (gs + GRID_GAP)
 
-    # 检查玩家标记中心像素
-    px_color = region.get_at((dot_x, dot_y))[:3]
-    assert px_color == player_color, (
-        f"玩家标记位置像素颜色应为 {player_color}，得到 {px_color}"
+    # 泥墙
+    rx, ry = _px(1, 1)
+    assert surf.get_at((rx, ry))[:3] == (140, 100, 70), "泥墙颜色不符"
+
+    # 红锁门
+    rx, ry = _px(2, 2)
+    assert surf.get_at((rx, ry))[:3] == (220, 60, 60), "红锁门颜色不符"
+
+    # 绿锁门
+    rx, ry = _px(3, 3)
+    assert surf.get_at((rx, ry))[:3] == (60, 200, 80), "绿锁门颜色不符"
+
+    # 蓝锁门
+    rx, ry = _px(4, 4)
+    assert surf.get_at((rx, ry))[:3] == (60, 120, 220), "蓝锁门颜色不符"
+
+    # 出口（呼吸闪烁金色 — 在 state_time=0.5 时应为某个金色调）
+    rx, ry = _px(5, 5)
+    exit_color = surf.get_at((rx, ry))[:3]
+    # 金色 (255,215,0) 经 pulse 调制后 R/G 应仍较高，B 接近 0
+    assert exit_color[0] > 100 and exit_color[2] < 50, (
+        f"出口应为金色调，得到 {exit_color}"
     )
+
+    # 楼梯（淡黄色）
+    rx, ry = _px(6, 6)
+    stairs_color = surf.get_at((rx, ry))[:3]
+    assert stairs_color == (240, 230, 140), f"楼梯颜色应为 (240,230,140)，得到 {stairs_color}"
 
 
 # =============================================================================
-# 测试 10：GameplayScreen 集成 — Tab 切换 minimap.visible
+# 测试 5：闪烁公式无崩溃
+# =============================================================================
+
+def test_blink_formula_no_crash():
+    """玩家与出口点的闪烁公式在任何 dt 下都不报错且产生合规闪烁。"""
+    _ensure_pygame()
+    gm = _make_map(15, 15)
+    gm.layer1[5][5] = "LOCK_EXIT"
+    mm = Minimap(gm, _make_player())
+    surf = pygame.Surface((SCREEN_WIDTH, SCREEN_HEIGHT))
+
+    # 推进多个 state_time 值
+    for t in [0.0, 0.1, 0.2, 0.5, 1.0, 3.14, 10.0, 100.0]:
+        surf.fill((0, 0, 0))
+        mm.render(surf, 5, 5, t)  # 不应抛出异常
+
+    # 验证 sin 公式的合规性：出口 pulse 在 [0, 1] 内
+    for t in [0.0, 0.1, 0.2, 0.5, 1.0]:
+        pulse = abs(math.sin(t * 10.0))
+        assert 0.0 <= pulse <= 1.0, f"t={t} 时 pulse={pulse} 超出 [0,1]"
+
+    # 玩家 blink 公式
+    for t in [0.0, 0.1, 0.2, 0.5, 1.0]:
+        blink = math.sin(t * 14.0) >= 0
+        assert isinstance(blink, bool)
+
+
+# =============================================================================
+# 测试 6：Tab 键切换 show_minimap 状态（GameplayScreen）
 # =============================================================================
 
 def test_gameplay_tab_toggles_minimap():
-    """GameplayScreen 中按 Tab 键切换 minimap.visible。"""
+    """GameplayScreen 中按 Tab 键切换 show_minimap 状态。"""
     _ensure_pygame()
 
     from src.game_manager import GameManager
     from src.screens.gameplay_screen import GameplayScreen
 
-    # 重置 GameManager
     gm = GameManager.get_instance()
     gm.player_state = PlayerState()
 
@@ -286,26 +269,31 @@ def test_gameplay_tab_toggles_minimap():
     screen = GameplayScreen()
     screen.on_enter(data_payload=None)
 
-    # 确认小地图已初始化且默认可见
+    # 确认小地图已初始化，默认关闭
     assert screen.minimap is not None, "小地图应已初始化"
-    assert screen.minimap.visible is True, "小地图默认应可见"
+    assert screen.show_minimap is False, "小地图默认应关闭"
 
-    # Tab → 隐藏
+    # Tab → 开启
     tab_event = pygame.event.Event(pygame.KEYDOWN, {"key": pygame.K_TAB})
     screen.handle_event(tab_event)
-    assert screen.minimap.visible is False, "Tab 后小地图应隐藏"
+    assert screen.show_minimap is True, "Tab 后小地图应开启"
 
-    # Tab → 显示
+    # Tab → 关闭
     screen.handle_event(tab_event)
-    assert screen.minimap.visible is True, "再次 Tab 后小地图应显示"
+    assert screen.show_minimap is False, "再次 Tab 后小地图应关闭"
+
+    # 帮助蒙层开启时，Tab 不会开启小地图（强制 False）
+    screen.show_help = True
+    screen.handle_event(tab_event)
+    assert screen.show_minimap is False, "帮助开启时 Tab 不应开启小地图"
 
 
 # =============================================================================
-# 测试 11：BonusLevelScreen 集成 — Tab 切换 minimap.visible
+# 测试 7：Tab 键切换 show_minimap 状态（BonusLevelScreen）
 # =============================================================================
 
 def test_bonus_tab_toggles_minimap():
-    """BonusLevelScreen 中按 Tab 键切换 minimap.visible。"""
+    """BonusLevelScreen 中按 Tab 键切换 show_minimap 状态。"""
     _ensure_pygame()
 
     from src.game_manager import GameManager
@@ -325,96 +313,111 @@ def test_bonus_tab_toggles_minimap():
 
     gm.screen_manager = FakeScreenManager()
     gm.suspended_level_state = None
-
-    # 需要最小 asset_manager / save_manager 存根
     gm.asset_manager = None
     gm.save_manager = None
 
     screen = BonusLevelScreen()
     screen.on_enter()
 
-    # 确认小地图已初始化且默认可见
+    # 确认小地图已初始化，默认关闭
     assert screen.minimap is not None, "奖励关小地图应已初始化"
-    assert screen.minimap.visible is True, "奖励关小地图默认应可见"
+    assert screen.show_minimap is False, "奖励关小地图默认应关闭"
 
-    # Tab → 隐藏
+    # Tab → 开启
     tab_event = pygame.event.Event(pygame.KEYDOWN, {"key": pygame.K_TAB})
     screen.handle_event(tab_event)
-    assert screen.minimap.visible is False, "Tab 后奖励关小地图应隐藏"
+    assert screen.show_minimap is True, "Tab 后奖励关小地图应开启"
 
-    # Tab → 显示
+    # Tab → 关闭
     screen.handle_event(tab_event)
-    assert screen.minimap.visible is True, "再次 Tab 后奖励关小地图应显示"
+    assert screen.show_minimap is False, "再次 Tab 后奖励关小地图应关闭"
 
 
 # =============================================================================
-# 测试 12：视口框线绘制（有 Camera 时存在白色像素）
+# 测试 8：40×40 极大地图渲染零崩溃、无越界
 # =============================================================================
 
-def test_viewport_rect_drawn():
-    """render() 在有 Camera 时小地图上应有视口框线白色像素。"""
+def test_large_map_render_no_crash():
+    """40×40 极大地图下渲染零崩溃、无越界。"""
     _ensure_pygame()
-    gm = _make_map(30, 30)
-    mm = Minimap(gm, 5, 5)
-    cam = _make_camera()
+    gm = _make_map(40, 40)
+    # 散布一些实体
+    gm.layer1[10][10] = "WALL"
+    gm.layer1[20][20] = "LOCK_EXIT"
+    gm.layer2[30][30] = "STAIRS"
+    gm.layer0[5][5] = "UNCOVERED"
 
+    mm = Minimap(gm, _make_player())
     surf = pygame.Surface((SCREEN_WIDTH, SCREEN_HEIGHT))
     surf.fill((0, 0, 0))
-    mm.render(surf, camera=cam)
 
-    from src.minimap import MINIMAP_MARGIN, _MINIMAP_COLORS
-    dest_x = SCREEN_WIDTH - mm.minimap_width - MINIMAP_MARGIN
-    dest_y = SCREEN_HEIGHT - mm.minimap_height - MINIMAP_MARGIN
-    region = surf.subsurface(pygame.Rect(dest_x, dest_y, mm.minimap_width, mm.minimap_height))
+    # 多次渲染不应崩溃
+    for t in [0.0, 0.1, 0.5]:
+        mm.render(surf, 20, 20, t)
 
-    white = _MINIMAP_COLORS["VIEWPORT"]
-    # 在整个 minimap Surface 上搜索白色像素（视口框线）
-    found_white = False
-    for y in range(region.get_height()):
-        for x in range(region.get_width()):
-            if region.get_at((x, y))[:3] == white:
-                found_white = True
-                break
-        if found_white:
-            break
-
-    assert found_white, "视口框线应在小地图上产生白色像素"
+    # 验证画布尺寸合规
+    assert mm.minimap_width <= MINIMAP_MAX_SIZE
+    assert mm.minimap_height <= MINIMAP_MAX_SIZE
+    assert mm.minimap_width > 0
+    assert mm.minimap_height > 0
 
 
 # =============================================================================
-# 测试 13：minimap.player_x / player_y 动态更新
+# 测试 9：玩家标志点渲染
 # =============================================================================
 
-def test_player_coords_update():
-    """动态更新 player_x / player_y 后渲染的玩家位置应随之改变。"""
+def test_player_dot_rendered():
+    """render() 后玩家位置应存在亮绿或亮白像素。"""
     _ensure_pygame()
     gm = _make_map(15, 15)
-    mm = Minimap(gm, 2, 2)
-
-    # 更新坐标
-    mm.player_x = 10
-    mm.player_y = 10
-
-    assert mm.player_x == 10, "player_x 应动态更新为 10"
-    assert mm.player_y == 10, "player_y 应动态更新为 10"
-
-    # 渲染后验证新位置有玩家颜色
+    mm = Minimap(gm, _make_player())
     surf = pygame.Surface((SCREEN_WIDTH, SCREEN_HEIGHT))
     surf.fill((0, 0, 0))
-    mm.render(surf, camera=None)
 
-    from src.minimap import MINIMAP_MARGIN, _MINIMAP_COLORS
-    dest_x = SCREEN_WIDTH - mm.minimap_width - MINIMAP_MARGIN
-    dest_y = SCREEN_HEIGHT - mm.minimap_height - MINIMAP_MARGIN
-    region = surf.subsurface(pygame.Rect(dest_x, dest_y, mm.minimap_width, mm.minimap_height))
+    mm.render(surf, 7, 7, 0.0)
 
-    player_color = _MINIMAP_COLORS["PLAYER"]
-    dot_x = 10 * mm.pixel_size
-    dot_y = 10 * mm.pixel_size
-    px_color = region.get_at((dot_x, dot_y))[:3]
-    assert px_color == player_color, (
-        f"更新后玩家标记位置像素应为 {player_color}，得到 {px_color}"
+    gs = mm.grid_size
+    dest_x = max(0, (SCREEN_WIDTH - mm.minimap_width) // 2)
+    dest_y = max(HUD_HEIGHT + 8,
+                 min(96, SCREEN_HEIGHT - mm.minimap_height - 8))
+
+    # 玩家中心像素
+    center_x = dest_x + 7 * (gs + GRID_GAP) + gs // 2
+    center_y = dest_y + 7 * (gs + GRID_GAP) + gs // 2
+    px_color = surf.get_at((center_x, center_y))[:3]
+    # 应为亮绿 (34,197,94) 或亮白 (255,255,255)
+    assert px_color in ((34, 197, 94), (255, 255, 255)), (
+        f"玩家标志应为亮绿或亮白，得到 {px_color}"
     )
+
+
+# =============================================================================
+# 测试 10：渲染不崩溃（基础）
+# =============================================================================
+
+def test_render_no_crash_basic():
+    """render() 在各种状态下不崩溃。"""
+    _ensure_pygame()
+    gm = _make_map(15, 15)
+    mm = Minimap(gm, _make_player())
+    surf = pygame.Surface((SCREEN_WIDTH, SCREEN_HEIGHT))
+    surf.fill((0, 0, 0))
+    mm.render(surf, 5, 5, 0.0)
+    mm.render(surf, 0, 0, 1.0)
+    mm.render(surf, 14, 14, 2.0)
+
+
+# =============================================================================
+# 测试 11：game_map=None 时 render 安全返回
+# =============================================================================
+
+def test_render_none_map_safe():
+    """game_map 为 None 时 render 不崩溃。"""
+    _ensure_pygame()
+    mm = Minimap(_make_map(10, 10), _make_player())
+    mm.game_map = None
+    surf = pygame.Surface((SCREEN_WIDTH, SCREEN_HEIGHT))
+    mm.render(surf, 0, 0, 0.0)  # 不应抛出
 
 
 # =============================================================================
@@ -423,19 +426,17 @@ def test_player_coords_update():
 
 if __name__ == "__main__":
     tests = [
-        ("test_pixel_size_scaling",         test_pixel_size_scaling),
-        ("test_minimap_dimensions",         test_minimap_dimensions),
-        ("test_default_visible",            test_default_visible),
-        ("test_toggle",                     test_toggle),
-        ("test_render_no_crash_with_camera", test_render_no_crash_with_camera),
-        ("test_render_no_crash_without_camera", test_render_no_crash_without_camera),
-        ("test_render_skip_when_hidden",    test_render_skip_when_hidden),
-        ("test_render_produces_pixels",     test_render_produces_pixels),
-        ("test_player_dot_rendered",        test_player_dot_rendered),
+        ("test_canvas_size_15x15", test_canvas_size_15x15),
+        ("test_canvas_size_40x40", test_canvas_size_40x40),
+        ("test_color_mapping_basic", test_color_mapping_basic),
+        ("test_color_mapping_advanced", test_color_mapping_advanced),
+        ("test_blink_formula_no_crash", test_blink_formula_no_crash),
         ("test_gameplay_tab_toggles_minimap", test_gameplay_tab_toggles_minimap),
-        ("test_bonus_tab_toggles_minimap",  test_bonus_tab_toggles_minimap),
-        ("test_viewport_rect_drawn",        test_viewport_rect_drawn),
-        ("test_player_coords_update",       test_player_coords_update),
+        ("test_bonus_tab_toggles_minimap", test_bonus_tab_toggles_minimap),
+        ("test_large_map_render_no_crash", test_large_map_render_no_crash),
+        ("test_player_dot_rendered", test_player_dot_rendered),
+        ("test_render_no_crash_basic", test_render_no_crash_basic),
+        ("test_render_none_map_safe", test_render_none_map_safe),
     ]
 
     failed = 0

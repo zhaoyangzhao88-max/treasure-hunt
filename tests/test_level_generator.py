@@ -101,10 +101,14 @@ def test_start_is_uncovered():
 
 
 def test_key_exit_placed():
-    """验证 KEY_EXIT 始终存在（解锁出口门）。"""
+    """验证 KEY_EXIT 始终存在（解锁出口门）。
+
+    注：第 49 课起，10 的倍数关卡为 Boss 关，KEY_EXIT 不再散放，
+    改为由法老王首领死亡掉落。因此 Boss 关不检查 KEY_EXIT。
+    """
     gen = LevelGenerator(seed=42)
 
-    for level in [1, 2, 3, 5, 10]:
+    for level in [1, 2, 3, 5]:
         m, _, _ = gen.generate_level(level)
         found_key_exit = any(
             m.layer2[y][x] == "KEY_EXIT"
@@ -167,13 +171,53 @@ def test_key_red_reachable_before_lock():
 
 
 def test_verify_solvability_generated_levels():
-    """验证生成的关卡通过求解器。"""
+    """验证生成的关卡通过求解器。
+
+    注：第 49 课起，10 的倍数关卡为 Boss 关，标准求解器无法建模
+    「击败 Boss → 掉落钥匙」的流程，因此改用结构可达性验证
+    （Boss 从起点可达 + Boss 与出口相邻）。
+    """
+    from src.config import MUMMY_KING, BOSS_LEVEL_INTERVAL
+
+    def _solver_reachable(gm, start):
+        visited = {start}
+        q = deque([start])
+        while q:
+            cx, cy = q.popleft()
+            for dx, dy in ((1, 0), (-1, 0), (0, 1), (0, -1)):
+                nx, ny = cx + dx, cy + dy
+                if (gm.is_in_bounds(nx, ny) and (nx, ny) not in visited
+                        and gm.layer1[ny][nx] != "WALL"):
+                    visited.add((nx, ny))
+                    q.append((nx, ny))
+        return visited
+
     for seed in [1, 2, 3, 4, 5, 42]:
         gen = LevelGenerator(seed=seed)
-        for level in [1, 3, 5, 10]:
+        for level in [1, 3, 5, 10, 20]:
             m, start, exit_ = gen.generate_level(level)
-            assert gen.verify_solvability(m, start, exit_), \
-                f"seed={seed}, level={level} 应可解"
+            is_boss = (level >= BOSS_LEVEL_INTERVAL
+                       and level % BOSS_LEVEL_INTERVAL == 0)
+            if is_boss:
+                # Boss 关：标准求解器不适用，验证结构可达性
+                reach = _solver_reachable(m, start)
+                boss_pos = None
+                king_count = 0
+                for y in range(m.height):
+                    for x in range(m.width):
+                        if m.layer2[y][x] == MUMMY_KING:
+                            king_count += 1
+                            boss_pos = (x, y)
+                assert king_count == 1, \
+                    f"seed={seed}, level={level}: 应有 1 Boss，实际 {king_count}"
+                assert boss_pos in reach, \
+                    f"seed={seed}, level={level}: Boss {boss_pos} 不可达"
+                assert max(abs(boss_pos[0] - exit_[0]),
+                           abs(boss_pos[1] - exit_[1])) == 1, (
+                    f"seed={seed}, level={level}: Boss 不与出口相邻")
+            else:
+                assert gen.verify_solvability(m, start, exit_), \
+                    f"seed={seed}, level={level} 应可解"
 
     print("[PASS] test_verify_solvability_generated_levels")
 
@@ -267,11 +311,43 @@ def test_minimum_grid_15x15():
 
 
 def test_large_grid_solvable():
-    """验证 level 20 (40x40) 可生成且可解。"""
+    """验证 level 20 (40x40) 可生成且结构可达。
+
+    注：level 20 为 Boss 关（10 的倍数），标准求解器不适用，
+    改用结构可达性验证（Boss 可达 + 邻出口）。
+    """
+    from src.config import MUMMY_KING
+
     gen = LevelGenerator(seed=11)
     m, start, exit_ = gen.generate_level(20)
     assert m.width == 40 and m.height == 40
-    assert gen.verify_solvability(m, start, exit_)
+
+    # Boss 关结构验证
+    def _solver_reachable(gm, s):
+        visited = {s}
+        q = deque([s])
+        while q:
+            cx, cy = q.popleft()
+            for dx, dy in ((1, 0), (-1, 0), (0, 1), (0, -1)):
+                nx, ny = cx + dx, cy + dy
+                if (gm.is_in_bounds(nx, ny) and (nx, ny) not in visited
+                        and gm.layer1[ny][nx] != "WALL"):
+                    visited.add((nx, ny))
+                    q.append((nx, ny))
+        return visited
+
+    reach = _solver_reachable(m, start)
+    boss_pos = None
+    king_count = 0
+    for y in range(m.height):
+        for x in range(m.width):
+            if m.layer2[y][x] == MUMMY_KING:
+                king_count += 1
+                boss_pos = (x, y)
+    assert king_count == 1, f"Level 20 应有 1 Boss，实际 {king_count}"
+    assert boss_pos in reach, f"Level 20 Boss {boss_pos} 不可达"
+    assert max(abs(boss_pos[0] - exit_[0]),
+               abs(boss_pos[1] - exit_[1])) == 1, "Boss 应与出口相邻"
 
     print("[PASS] test_large_grid_solvable")
 

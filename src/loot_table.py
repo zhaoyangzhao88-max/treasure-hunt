@@ -31,6 +31,8 @@ class LootTable:
         "MAP": 10,
         "HEART": 3,
         "SHIELD": 2,
+        # 第 55 课：火把 — 稀有产出（权重 5，相对合计 105，约 4.76%）
+        "TORCH": 5,
     }
 
     def __init__(self, seed: int | None = None):

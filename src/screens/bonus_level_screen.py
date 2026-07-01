@@ -69,7 +69,8 @@ class BonusLevelScreen(BaseScreen):
         self.show_help: bool = False
         self.help_overlay: HelpOverlay | None = None
 
-        # 实时小地图（默认开启）
+        # 实时小地图（默认关闭，Tab 开启）
+        self.show_minimap: bool = False
         self.minimap: Minimap | None = None
 
     # =========================================================================
@@ -136,7 +137,7 @@ class BonusLevelScreen(BaseScreen):
         self.show_help = False
 
         # 7.5) 初始化小地图
-        self.minimap = Minimap(self.game_map, self.player_x, self.player_y)
+        self.minimap = Minimap(self.game_map, player)
 
         # 8) 预载音效（尝试加载金币叮当声，退化静默处理）
         try:
@@ -155,6 +156,7 @@ class BonusLevelScreen(BaseScreen):
         self.game_map = None
         self.interaction_controller = None
         self.tile_renderer = None
+        self.show_minimap = False
         self.minimap = None
 
     # =========================================================================
@@ -176,8 +178,11 @@ class BonusLevelScreen(BaseScreen):
 
         # ── Tab 切换小地图 ────────────────────────────────
         if event.type == pygame.KEYDOWN and event.key == pygame.K_TAB:
-            if self.minimap is not None:
-                self.minimap.toggle()
+            # 帮助蒙层开启时，强制关闭小地图
+            if self.show_help:
+                self.show_minimap = False
+            else:
+                self.show_minimap = not self.show_minimap
             return
 
         if event.type != pygame.KEYDOWN:
@@ -200,11 +205,6 @@ class BonusLevelScreen(BaseScreen):
         if result == "SUCCESS":
             # 更新本地坐标
             self.player_x, self.player_y = tx, ty
-
-            # 同步小地图玩家坐标
-            if self.minimap is not None:
-                self.minimap.player_x = tx
-                self.minimap.player_y = ty
 
             # 播放金币音效（退化静默）
             if self._coin_sound:
@@ -284,9 +284,10 @@ class BonusLevelScreen(BaseScreen):
         player_y = offset_y + py * cs
         self.tile_renderer.draw_tile(surface, "PLAYER", player_x, player_y)
 
-        # ---- 小地图（玩家上方、帮助蒙层之下）----
-        if self.minimap is not None and self.minimap.visible:
-            self.minimap.render(surface, camera=None)
+        # ---- 小地图（玩家上方、帮助蒙层之下）— 半透明叠加 ----
+        if self.show_minimap and self.minimap is not None:
+            self.minimap.render(surface, self.player_x, self.player_y,
+                                self.timer)
 
         # ---- 玩法指南蒙层（最顶层）----
         if self.show_help and self.help_overlay is not None:

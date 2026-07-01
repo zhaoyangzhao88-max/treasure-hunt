@@ -29,6 +29,7 @@ from audio_manager import AudioManager
 from save_manager import SaveManager
 from screen_manager import ScreenManager
 from player_state import PlayerState
+from achievement_manager import AchievementManager
 
 
 # dt 钳制上限 — 防止卡顿时角色/光标穿墙（见 docs/10 §2.3.2）
@@ -51,6 +52,7 @@ class GameManager:
         self.save_manager: SaveManager | None = None
         self.screen_manager: ScreenManager | None = None
         self.player_state: PlayerState | None = None
+        self.achievement_manager: AchievementManager | None = None
         self.suspended_level_state: dict | None = None
         self.settings_data: dict | None = None
         self.running: bool = False
@@ -94,6 +96,8 @@ class GameManager:
         self.audio_manager = AudioManager.get_instance()
         self.save_manager = SaveManager()
         self.screen_manager = ScreenManager()
+        if headless:
+            self.screen_manager.instant_mode = True  # Headless 模式跳过转场动画
 
         # 初始化玩家状态：尝试从存档加载，失败则保留默认 PlayerState
         self.player_state = PlayerState()
@@ -117,8 +121,19 @@ class GameManager:
 
         self.running = True
 
-        # ---- 自举装载：实例化并注册全部 7 个场景界面 ----
+        # ---- 自举装载：实例化并注册全部 10 个场景界面 ----
         self._register_all_screens()
+
+        # ---- 成就管理器 ----
+        # 放在 _register_all_screens 之后：player_state 已 hydrate 完成，
+        # check_unlocks 能读取到历史数据做静默回标，防老玩家首次进游戏被密集弹窗轰炸。
+        self.achievement_manager = AchievementManager(self)
+        try:
+            # silent=True：静默回标老玩家已达成项，防首次进游戏密集弹窗
+            self.achievement_manager.check_unlocks(silent=True)
+        except Exception:
+            # 成就评估绝不阻塞引擎启动
+            pass
 
     # =========================================================================
     # 主循环
@@ -148,10 +163,16 @@ class GameManager:
                 if self.screen_manager.current_screen is not None:
                     self.screen_manager.current_screen.handle_event(event)
 
-            # ---- 逻辑更新与画面渲染 ----
+            # ---- 逻辑更新与画面渲染（通过 ScreenManager 委托，支持转场状态机） ----
             if self.screen_manager.current_screen is not None:
-                self.screen_manager.current_screen.update(dt)
-                self.screen_manager.current_screen.render(self.screen)
+                self.screen_manager.update(dt)
+                self.screen_manager.render(self.screen)
+
+            # ---- 顶层悬浮覆盖层（跨场景常驻最外层） ----
+            # 成就解锁弹窗必须在所有场景之上渲染；放在 flip 之前保证每帧都叠加。
+            if self.achievement_manager is not None:
+                self.achievement_manager.update(dt)
+                self.achievement_manager.render(self.screen)
 
             pygame.display.flip()
 
@@ -168,8 +189,44 @@ class GameManager:
     # 自举装载（惰性场景注册）
     # =========================================================================
 
+    def bind_save_slot(self, slot_id: int) -> None:
+        """绑定指定存档槽位 — 重建 SaveManager 并重新加载玩家状态 / 设置。
+
+        第 46 课：多存档插槽选择。SaveSlotsScreen 在玩家选中某个槽位后调用此方法，
+        把全局 GameManager 的存档上下文整体切到目标槽。
+
+        Args:
+            slot_id: 槽位编号（1-based）
+        """
+        from src.save_manager import SaveManager
+
+        self.save_manager = SaveManager(slot_id=slot_id)
+
+        # 重新加载玩家状态
+        self.player_state = PlayerState()
+        data = None
+        try:
+            data = self.save_manager.load()
+            if data and "player" in data:
+                self.player_state = self._hydrate_player(data["player"])
+        except Exception:
+            pass
+
+        # 重新加载设置
+        self.settings_data = {"sound_volume": 1.0, "music_volume": 1.0}
+        if data and "settings" in data:
+            self.settings_data = data["settings"]
+
+        # 同步音量
+        self.audio_manager.set_music_volume(
+            self.settings_data.get("music_volume", 1.0)
+        )
+        self.audio_manager.set_sfx_volume(
+            self.settings_data.get("sound_volume", 1.0)
+        )
+
     def _register_all_screens(self):
-        """自举装载：惰性导入全部 7 个场景类并注册到 ScreenManager。
+        """自举装载：惰性导入全部场景类并注册到 ScreenManager。
 
         在 init_engine() 末尾自动调用。方法体内使用惰性 import 以避免
         与各 screen 模块中 ``from src.game_manager import GameManager``
@@ -183,6 +240,9 @@ class GameManager:
         from src.screens.level_complete_screen import LevelCompleteScreen  # noqa: E402
         from src.screens.game_over_screen import GameOverScreen            # noqa: E402
         from src.screens.settings_screen import SettingsScreen             # noqa: E402
+        from src.screens.stats_screen import StatsScreen                   # noqa: E402
+        from src.screens.save_slots_screen import SaveSlotsScreen          # noqa: E402
+        from src.screens.map_editor_screen import MapEditorScreen          # noqa: E402
         from src.config import GameState                                   # noqa: E402
 
         mappings = [
@@ -193,6 +253,9 @@ class GameManager:
             (GameState.LEVEL_COMPLETE, LevelCompleteScreen()),
             (GameState.GAME_OVER, GameOverScreen()),
             (GameState.SETTINGS, SettingsScreen()),
+            (GameState.STATS, StatsScreen()),
+            (GameState.SAVE_SLOT_SELECT, SaveSlotsScreen()),
+            (GameState.MAP_EDITOR, MapEditorScreen()),
         ]
         for state, instance in mappings:
             self.screen_manager.register_screen(state, instance)
@@ -234,6 +297,14 @@ class GameManager:
             state.highest_level_cleared = int(player_data["highest_level_cleared"])
         if "total_gold_earned" in player_data and player_data["total_gold_earned"] is not None:
             state.total_gold_earned = int(player_data["total_gold_earned"])
+        if "total_runs" in player_data and player_data["total_runs"] is not None:
+            state.total_runs = int(player_data["total_runs"])
+        if "total_monsters_slain" in player_data and player_data["total_monsters_slain"] is not None:
+            state.total_monsters_slain = int(player_data["total_monsters_slain"])
+
+        # ---- 成就徽章 ----
+        if "unlocked_badges" in player_data and isinstance(player_data["unlocked_badges"], list):
+            state.unlocked_badges = [str(b) for b in player_data["unlocked_badges"]]
 
         # ---- 背包工具 ----
         if "tools" in player_data and isinstance(player_data["tools"], dict):

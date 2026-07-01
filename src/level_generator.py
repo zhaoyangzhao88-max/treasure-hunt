@@ -19,6 +19,17 @@ if _src_dir not in _sys.path:
 
 from map_data import GameMap
 from loot_table import LootTable
+from config import (
+    ACTIVE_MUMMY,
+    ACTIVE_MUMMY_MIN_LEVEL,
+    ACTIVE_MUMMY_SPAWN_CHANCE,
+    MUMMY_KING,
+    BOSS_LEVEL_INTERVAL,
+    SPIKE_TRAP,
+    SPIKE_TRAP_MIN_LEVEL,
+    SPIKE_TRAP_DENSITY,
+    TORCH,
+)
 
 
 class LevelGenerator:
@@ -181,11 +192,17 @@ class LevelGenerator:
         return chokepoints
 
     def _place_lock_and_key(self, game_map: GameMap, level_num: int,
-                            start: tuple, exit_: tuple) -> None:
+                            start: tuple, exit_: tuple,
+                            is_boss_level: bool = False) -> None:
         """放置锁钥依赖链。
 
         始终放置 KEY_EXIT（解锁出口门）。
         level_num >= 2 时额外放置 LOCK_RED + KEY_RED 增加难度。
+
+        Args:
+            is_boss_level: True 表示当前为 Boss 关（10 的倍数）。
+                Boss 关**不放置散放的 KEY_EXIT** —— 终点钥匙改为由
+                法老王首领死亡掉落，玩家必须击败 Boss 方可通关。
         """
         # 计算主路径（忽略出口门，因为出口格被 LOCK_EXIT 占据）
         # 使用出口可达的最近邻居作为路径终点
@@ -211,14 +228,15 @@ class LevelGenerator:
         if not path:
             return  # 所有出口邻居都不可达（不应发生）
 
-        # ---- 始终放置 KEY_EXIT ----
+        # ---- 放置 KEY_EXIT（Boss 关跳过 —— 钥匙改为 Boss 掉落） ----
         # KEY_EXIT 放在路径前半段（玩家获取后能打开出口）
         # 如果存在 LOCK_RED，KEY_EXIT 必须在 LOCK_RED 之后（先拿红钥匙过红门）
-        key_exit_idx = len(path) // 3  # 路径前 1/3 处
-        key_exit_pos = path[key_exit_idx]
-        cur = game_map.layer2[key_exit_pos[1]][key_exit_pos[0]]
-        if cur == "NONE":
-            game_map.set_entity(key_exit_pos[0], key_exit_pos[1], "KEY_EXIT")
+        if not is_boss_level:
+            key_exit_idx = len(path) // 3  # 路径前 1/3 处
+            key_exit_pos = path[key_exit_idx]
+            cur = game_map.layer2[key_exit_pos[1]][key_exit_pos[0]]
+            if cur == "NONE":
+                game_map.set_entity(key_exit_pos[0], key_exit_pos[1], "KEY_EXIT")
 
         # ---- level >= 2：放置 LOCK_RED + KEY_RED ----
         if level_num < 2:
@@ -265,7 +283,8 @@ class LevelGenerator:
         # 重新计算路径（LOCK_RED 已放置），更新 KEY_EXIT 位置确保可达
         # KEY_EXIT 必须在 LOCK_RED 之前可达
         reachable_before_red = self._bfs_reachable(game_map, start, blocked=gate_pos)
-        if key_exit_pos not in reachable_before_red:
+        if (not is_boss_level
+                and key_exit_pos not in reachable_before_red):
             # 重新放置 KEY_EXIT 到可达区域
             new_candidates = [
                 pos for pos in reachable_before_red
@@ -315,6 +334,54 @@ class LevelGenerator:
 
         for tx, ty in self._rng.sample(placeable, num_traps):
             game_map.traps[ty][tx] = True
+
+    def _place_spike_traps(self, game_map: GameMap, level_num: int,
+                           start: tuple, exit_: tuple) -> None:
+        """在通道 DIRT 格子上以 ``SPIKE_TRAP_DENSITY`` 概率放置周期地刺。
+
+        候选格子：
+        - layer0 == "DIRT"（泥土覆盖，尚未揭开）
+        - layer1 == "NONE"（无障碍物）
+        - layer2 == "NONE"（无实体）
+        - 不在起点 3×3 安全区内
+        - 非终点门位置
+        - 非静态雷格（避免地刺与静态雷叠加混淆语义）
+
+        地刺写入 ``layer2``（实体层），``is_walkable`` 不检查 layer2，
+        因此地刺不阻挡行走——玩家步入时由 InteractionController 处理伤害。
+
+        每格独立采样 ``rng.random() < SPIKE_TRAP_DENSITY``，避免
+        ``rng.sample`` 在候选不足时抛 ValueError（期望数量 ≈ placeable × 4%）。
+
+        仅在 ``level_num >= SPIKE_TRAP_MIN_LEVEL`` 时启用。
+        """
+        if level_num < SPIKE_TRAP_MIN_LEVEL:
+            return
+
+        sx, sy = start
+        safe_zone = {
+            (sx + dx, sy + dy)
+            for dx in (-1, 0, 1)
+            for dy in (-1, 0, 1)
+            if game_map.is_in_bounds(sx + dx, sy + dy)
+        }
+
+        for y in range(game_map.height):
+            for x in range(game_map.width):
+                if (x, y) in safe_zone:
+                    continue
+                if (x, y) == exit_:
+                    continue
+                if game_map.layer0[y][x] != "DIRT":
+                    continue
+                if game_map.layer1[y][x] != "NONE":
+                    continue
+                if game_map.layer2[y][x] != "NONE":
+                    continue
+                if game_map.traps[y][x]:
+                    continue
+                if self._rng.random() < SPIKE_TRAP_DENSITY:
+                    game_map.set_entity(x, y, SPIKE_TRAP)
 
     def _is_dead_end(self, game_map: GameMap, x: int, y: int) -> bool:
         """判定 (x, y) 是否为迷宫死胡同。
@@ -433,6 +500,18 @@ class LevelGenerator:
         if not candidates:
             return
 
+        # ── 火把散布（第 55 课） ──────────────────────────────────────
+        # 约 2% 的通路的格子散放火把（至少 1 个），提供战争迷雾视野加成
+        torch_count = max(1, int(len(candidates) * 0.02)) if candidates else 0
+        actual_torches = min(torch_count, len(candidates))
+        for _ in range(actual_torches):
+            idx = self._rng.randint(0, len(candidates) - 1)
+            pos = candidates.pop(idx)
+            game_map.set_entity(pos[0], pos[1], TORCH)
+
+        if not candidates:
+            return
+
         # ── LootTable 动态通用道具 ──────────────────────────────────
         # 使用 LootTable.get_random_loot 决定每个槽位的实体
         loot_table = LootTable(seed=level_num)
@@ -443,13 +522,18 @@ class LevelGenerator:
             entity = loot_table.get_random_loot(level_num)
             game_map.set_entity(pos[0], pos[1], entity)
 
-    def _place_monsters(self, game_map: GameMap, start: tuple,
-                        exit_: tuple) -> None:
+    def _place_monsters(self, game_map: GameMap, level_num: int,
+                        start: tuple, exit_: tuple) -> None:
         """在通道格子上随机散落 2~4 个怪物。
 
         怪物放在通路格子上（玩家可走过的空地），
         确保起点 3×3 安全区内绝无怪物。
         排除出口格及已有实体的格子。
+
+        当 ``level_num >= ACTIVE_MUMMY_MIN_LEVEL`` 时，每个怪物候选格以
+        ``ACTIVE_MUMMY_SPAWN_CHANCE`` 概率被替换为活性木乃伊 ACTIVE_MUMMY
+        （在 layer2 写入，延后到 InteractionController.link_active_mummies_from_map
+        阶段创建对应 ActiveMummy 实例）。
         """
         sx, sy = start
         safe_zone = {
@@ -479,10 +563,96 @@ class LevelGenerator:
         if actual <= 0:
             return
 
+        spawn_active = level_num >= ACTIVE_MUMMY_MIN_LEVEL
         for _ in range(actual):
             idx = self._rng.randint(0, len(candidates) - 1)
             pos = candidates.pop(idx)
-            game_map.set_entity(pos[0], pos[1], "MONSTER")
+            if spawn_active and self._rng.random() < ACTIVE_MUMMY_SPAWN_CHANCE:
+                game_map.set_entity(pos[0], pos[1], ACTIVE_MUMMY)
+            else:
+                game_map.set_entity(pos[0], pos[1], "MONSTER")
+
+    def _place_boss(self, game_map: GameMap, start: tuple, exit_: tuple) -> None:
+        """在终点门前的必经卡点放置 1 只法老王首领（第 49 课）。
+
+        选取出口相邻的格子（层 1 非 WALL、层 2 为空）作为 Boss 放置格。
+        该格保证：
+        - 与出口门相邻（玩家击败 Boss 取得 KEY_EXIT 后一步即可开门）
+        - 从起点「可到达」—— 使用与 ``verify_solvability`` 一致的通行规则
+          （仅 WALL 阻挡，DIRT 视为可挖掘通行），确保玩家能走到
+          Boss 相邻格发动攻击。
+        - 层 2 当前为空（避免覆盖已有道具/怪物）。
+
+        玩家必须击败 Boss 取得掉落的 KEY_EXIT 方可开门通关，
+        形成「终点门前必战」的铁板约束。
+        """
+        # 候选格：出口四周、层 1 非 WALL、层 2 为空
+        candidates = []
+        for dx, dy in ((1, 0), (-1, 0), (0, 1), (0, -1)):
+            nx, ny = exit_[0] + dx, exit_[1] + dy
+            if not game_map.is_in_bounds(nx, ny):
+                continue
+            if game_map.layer1[ny][nx] == "WALL":
+                continue
+            if game_map.layer2[ny][nx] != "NONE":
+                continue
+            candidates.append((nx, ny))
+
+        if not candidates:
+            # 极端回退：允许覆盖层 2 非空格（保证 Boss 关始终有 Boss）
+            for dx, dy in ((1, 0), (-1, 0), (0, 1), (0, -1)):
+                nx, ny = exit_[0] + dx, exit_[1] + dy
+                if (game_map.is_in_bounds(nx, ny)
+                        and game_map.layer1[ny][nx] != "WALL"):
+                    game_map.set_entity(nx, ny, MUMMY_KING)
+                    return
+            return
+
+        # 使用与 verify_solvability 一致的通行规则计算可达集合
+        # （仅 WALL 阻挡 —— DIRT 视为可挖掘通行）
+        reachable = self._bfs_reachable_ignore_dirt(game_map, start)
+
+        # 在可达的候选格中，选曼哈顿距离出口最近的（最贴近出口的卡点）
+        best = None
+        best_dist = float("inf")
+        for cx, cy in candidates:
+            if (cx, cy) not in reachable:
+                continue
+            dist = abs(cx - exit_[0]) + abs(cy - exit_[1])
+            if dist < best_dist:
+                best = (cx, cy)
+                best_dist = dist
+
+        if best is not None:
+            game_map.set_entity(best[0], best[1], MUMMY_KING)
+            return
+
+        # 极端回退：候选格均不可达 —— 直接覆盖首个候选
+        fb = candidates[0]
+        game_map.set_entity(fb[0], fb[1], MUMMY_KING)
+
+    def _bfs_reachable_ignore_dirt(self, game_map: GameMap,
+                                   start: tuple) -> set:
+        """BFS 返回从 start 可达的位置集合（仅 WALL 阻挡，DIRT 视为可通行）。
+
+        与 ``verify_solvability`` 的通行规则一致，用于判断玩家是否能
+        挖掘到目标格。
+        """
+        queue = deque([start])
+        visited = {start}
+        while queue:
+            cx, cy = queue.popleft()
+            for dx, dy in ((1, 0), (-1, 0), (0, 1), (0, -1)):
+                nx, ny = cx + dx, cy + dy
+                if not game_map.is_in_bounds(nx, ny):
+                    continue
+                if (nx, ny) in visited:
+                    continue
+                if game_map.layer1[ny][nx] == "WALL":
+                    continue
+                visited.add((nx, ny))
+                queue.append((nx, ny))
+        return visited
 
     # =========================================================================
     # 核心 API：generate_level
@@ -499,6 +669,10 @@ class LevelGenerator:
         """
         grid_size = self._get_grid_size(level_num)
         trap_density = self._get_trap_density(level_num)
+
+        # 第 49 课：关卡编号为 BOSS_LEVEL_INTERVAL 整数倍时为 Boss 关
+        is_boss_level = (level_num >= BOSS_LEVEL_INTERVAL
+                         and level_num % BOSS_LEVEL_INTERVAL == 0)
 
         game_map = GameMap(grid_size, grid_size)
 
@@ -533,13 +707,20 @@ class LevelGenerator:
                     game_map.layer1[ny][nx] = "NONE"
                     break
 
-        # 阶段 2：锁钥依赖
-        self._place_lock_and_key(game_map, level_num, start, exit_)
+        # 阶段 2：锁钥依赖（Boss 关跳过 KEY_EXIT —— 钥匙由 Boss 掉落）
+        self._place_lock_and_key(game_map, level_num, start, exit_,
+                                 is_boss_level=is_boss_level)
 
-        # 阶段 3：雷区 + 道具 + 怪物
+        # 阶段 3：雷区 + 地刺 + 道具 + 怪物
         self._place_traps(game_map, trap_density, start)
+        # 第 50 课：Level >= 3 时散放周期地刺（写入 layer2，不阻挡行走）
+        self._place_spike_traps(game_map, level_num, start, exit_)
         self._scatter_entities(game_map, level_num, start, exit_)
-        self._place_monsters(game_map, start, exit_)
+        self._place_monsters(game_map, level_num, start, exit_)
+
+        # 第 49 课：Boss 关在终点门前放置 1 只法老王首领
+        if is_boss_level:
+            self._place_boss(game_map, start, exit_)
 
         return game_map, start, exit_
 

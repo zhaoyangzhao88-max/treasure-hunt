@@ -121,6 +121,14 @@ class LevelCompleteScreen(BaseScreen):
             },
         )
 
+        # ---- 成就评估（通关后金币/层数可能解锁新段位）----
+        try:
+            am = self.game_manager.achievement_manager
+            if am is not None:
+                am.check_unlocks()
+        except Exception:
+            pass
+
         # ---- 初始化字体 ----
         self.font_title = self.asset_manager.get_font("default", 64)
         self.font_stats = self.asset_manager.get_font("default", 36)
@@ -198,6 +206,11 @@ class LevelCompleteScreen(BaseScreen):
             ):
                 if self.sound_click is not None:
                     self.sound_click.play()
+                # 主动保存退出：把本局战绩登入本地 Top 5 排行榜
+                self.game_manager.save_manager.add_leaderboard_entry(
+                    self.completed_level,
+                    self.game_manager.player_state.total_gold_earned,
+                )
                 self.screen_manager.switch_screen(GameState.MAIN_MENU)
 
     def _route_next_level(self):
@@ -302,9 +315,12 @@ class LevelCompleteScreen(BaseScreen):
             "current_shields": ps.current_shields,
             "bag_tier_index": ps.bag_tier_index,
             "highest_level_cleared": ps.highest_level_cleared,
-            "total_runs": 0,
+            "total_runs": ps.total_runs,
+            "total_monsters_slain": ps.total_monsters_slain,
             "total_gold_earned": ps.total_gold_earned,
             "gold": ps.gold,
             "tools": dict(ps.tools),
             "keys": dict(ps.keys),
+            "has_amulet": getattr(ps, "has_amulet", False),
+            "unlocked_badges": list(getattr(ps, "unlocked_badges", []) or []),
         }

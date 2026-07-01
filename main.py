@@ -3,7 +3,7 @@ Microsoft Treasure Hunt — 游戏入口主程序
 
 职责：
 1. 环境自检（Python 版本、Pygame 可用性）
-2. 自适应引擎初始化（自动注册全部 7 个场景界面）
+2. 自适应引擎初始化（自动注册全部 9 个场景界面）
 3. 启动前场景注册完整性校验
 4. 阻塞式主循环
 5. 顶层异常捕获与崩溃日志转储
@@ -25,8 +25,9 @@ if _src_dir not in sys.path:
 
 import pygame
 
-# 显式导入 GameState 枚举与全部 7 个场景类（用户要求）
+# 显式导入 GameState 枚举与全部 9 个场景类（用户要求）
 from src.config import GameState
+from src.asset_manager import get_resource_path
 from src.screens.main_menu_screen import MainMenuScreen
 from src.screens.gameplay_screen import GameplayScreen
 from src.screens.mummy_shop_screen import MummyShopScreen
@@ -34,6 +35,8 @@ from src.screens.bonus_level_screen import BonusLevelScreen
 from src.screens.level_complete_screen import LevelCompleteScreen
 from src.screens.game_over_screen import GameOverScreen
 from src.screens.settings_screen import SettingsScreen
+from src.screens.stats_screen import StatsScreen
+from src.screens.save_slots_screen import SaveSlotsScreen
 
 
 # =============================================================================
@@ -48,8 +51,10 @@ REQUIRED_SCREENS: list[tuple[GameState, type]] = [
     (GameState.LEVEL_COMPLETE, LevelCompleteScreen),
     (GameState.GAME_OVER, GameOverScreen),
     (GameState.SETTINGS, SettingsScreen),
+    (GameState.STATS, StatsScreen),
+    (GameState.SAVE_SLOT_SELECT, SaveSlotsScreen),
 ]
-"""所有 7 个 GameState 值与其对应场景类的映射关系，用于启动校验。"""
+"""所有 GameState 值与其对应场景类的映射关系，用于启动校验。"""
 
 CRASH_LOG_DIR = "crash_logs"
 """崩溃转储目录（相对于工作目录）。"""
@@ -78,6 +83,12 @@ def check_environment() -> list[tuple[str, str, bool]]:
     pg_ok = bool(pg_ver)
     results.append(("Pygame 版本", pg_ver, pg_ok))
 
+    # -- 资产目录自检（使用自愈路径解析器，兼容 PyInstaller 打包态） --
+    for asset_subdir in ("assets/images", "assets/sounds", "assets/fonts"):
+        abs_path = get_resource_path(asset_subdir)
+        dir_ok = os.path.isdir(abs_path)
+        results.append((f"资产目录 {asset_subdir}", abs_path, dir_ok))
+
     return results
 
 
@@ -86,7 +97,7 @@ def check_environment() -> list[tuple[str, str, bool]]:
 # =============================================================================
 
 def verify_screen_registrations() -> list[str]:
-    """校验全部 7 个 Required 场景是否已注册且类型正确。
+    """校验全部 9 个 Required 场景是否已注册且类型正确。
 
     要求在调用前已完成 GameManager.get_instance().init_engine()。
 
@@ -152,17 +163,19 @@ def main():
 
     流程：
     1. 环境自检 — 任一检查失败则终止
-    2. 引擎初始化（含全部 7 个场景的自动注册）
+    2. 引擎初始化（含全部 9 个场景的自动注册）
     3. 场景注册完整性校验（仅警告，不阻塞）
     4. 进入阻塞式主循环（外部 quit_game() 或异常可退出）
     """
     # ---- 1. 环境自检 ----
+    # 仅 Python 与 Pygame 版本为硬性门槛；资产目录缺失由 AssetManager 优雅降级
     print("[Microsoft Treasure Hunt] 正在启动...")
     all_ok = True
     for name, detail, ok in check_environment():
         icon = "OK" if ok else "FAIL"
         print(f"  [{icon}] {name}: {detail}")
-        if not ok:
+        # 只有前 2 项（Python 版本、Pygame 版本）是硬性门槛
+        if not ok and name in ("Python 版本", "Pygame 版本"):
             all_ok = False
     if not all_ok:
         print("环境检查未通过，即将退出。")

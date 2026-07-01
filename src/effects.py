@@ -277,6 +277,44 @@ class EffectsManager:
         for ft in self.floating_texts:
             ft.render(surface, camera_offset)
 
+    def spawn_shield_shatter(self, x: float, y: float, count: int = 20):
+        """在指定坐标引爆一圈亮青色防御罩晶莹碎片粒子。
+
+        用于护盾吸收伤害时的视觉反馈 — 碎片速度快、寿命短、呈放射状扩散。
+
+        Args:
+            x, y: 世界像素坐标（通常为玩家中心）
+            count: 碎片数量（默认 20）
+        """
+        for _ in range(count):
+            angle = random.uniform(0, 2 * math.pi)
+            speed = random.uniform(150.0, 320.0)  # 比通用粒子更快
+            vx = math.cos(angle) * speed
+            vy = math.sin(angle) * speed  # 无向上偏置，纯放射
+            size = random.randint(2, 4)
+            lifetime = random.uniform(0.3, 0.6)  # 更短促
+
+            particle = Particle(x, y, vx, vy, (0, 240, 255), size, lifetime)
+            self.particles.append(particle)
+
+    def spawn_clover_spark(self, x: float, y: float):
+        """在玩家脚底喷射 1~2 个嫩绿色荧光轨迹粒子。
+
+        用于四叶草（金币翻倍）持有者的幸运视效 — 粒子向上缓慢漂移、
+        逐渐变小，寿命约 0.5s。
+
+        Args:
+            x, y: 世界像素坐标（通常为玩家脚底位置）
+        """
+        for _ in range(random.randint(1, 2)):
+            vx = random.uniform(-20.0, 20.0)
+            vy = random.uniform(-60.0, -30.0)  # 向上漂移
+            size = random.randint(2, 3)
+            lifetime = random.uniform(0.35, 0.55)
+
+            particle = Particle(x, y, vx, vy, (34, 197, 94), size, lifetime)
+            self.particles.append(particle)
+
     def clear(self):
         """立即清空所有特效。"""
         self.particles.clear()

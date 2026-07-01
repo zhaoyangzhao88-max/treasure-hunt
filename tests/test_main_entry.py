@@ -4,8 +4,8 @@
 1. check_environment() 返回正确的 (name, detail, ok) 三元组格式
 2. Python 版本检查 (>= 3.8) 通过
 3. Pygame 版本检查通过
-4. REQUIRED_SCREENS 精确覆盖全部 7 个 GameState 枚举值（无遗漏无多余）
-5. init_engine 后全部 7 个场景均已注册且类型正确
+4. REQUIRED_SCREENS 精确覆盖全部 9 个 GameState 枚举值（无遗漏无多余）
+5. init_engine 后全部 9 个场景均已注册且类型正确
 6. write_crash_log() 正确写入包含异常详细信息的 .log 文件
 7. 未调用 init_engine 时 verify_screen_registrations() 返回错误
 """
@@ -121,13 +121,14 @@ def test_pygame_check():
 
 
 # ==========================================================================
-# 测试 4: REQUIRED_SCREENS 覆盖所有 7 个 GameState
+# 测试 4: REQUIRED_SCREENS 覆盖所有 9 个 GameState
 # ==========================================================================
 
 def test_required_screens_covers_all_states():
-    """REQUIRED_SCREENS 应精确覆盖全部 7 个 GameState 枚举值。"""
+    """REQUIRED_SCREENS 应覆盖除 MAP_EDITOR 外的全部 GameState 枚举值。"""
     registered_states = {state for state, _ in REQUIRED_SCREENS}
-    all_states = set(GameState)
+    # MAP_EDITOR 不在 REQUIRED_SCREENS 中（由 game_manager.py 单独注册）
+    all_states = {s for s in GameState if s != GameState.MAP_EDITOR}
 
     missing = all_states - registered_states
     extra = registered_states - all_states
@@ -142,11 +143,11 @@ def test_required_screens_covers_all_states():
 
 
 # ==========================================================================
-# 测试 5: init_engine 后全部 7 个场景已注册
+# 测试 5: init_engine 后全部 9 个场景已注册
 # ==========================================================================
 
 def test_all_screens_registered_after_init():
-    """init_engine(headless=True) 后，全部 7 个场景已注册且类型正确。"""
+    """init_engine(headless=True) 后，全部 10 个场景已注册且类型正确。"""
     _reset_singletons()
     mgr = GameManager.get_instance()
     mgr.init_engine(headless=True)
@@ -154,8 +155,8 @@ def test_all_screens_registered_after_init():
     errors = verify_screen_registrations()
     assert len(errors) == 0, f"场景注册错误: {errors}"
 
-    assert len(mgr.screen_manager.screens) == 7, (
-        f"ScreenManager 包含 {len(mgr.screen_manager.screens)} 个场景，期望 7"
+    assert len(mgr.screen_manager.screens) == 10, (
+        f"ScreenManager 包含 {len(mgr.screen_manager.screens)} 个场景，期望 10"
     )
 
     print("[PASS] test_all_screens_registered_after_init")

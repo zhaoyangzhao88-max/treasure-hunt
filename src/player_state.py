@@ -47,6 +47,9 @@ class PlayerState:
         # ---- 生涯统计 ----
         self.highest_level_cleared: int = 0
         self.total_gold_earned: int = 0
+        self.total_runs: int = 0          # 累计开始新游戏的次数
+        self.total_monsters_slain: int = 0  # 累计击杀木乃伊数量
+        self.unlocked_badges: list = []   # 已解锁成就 ID，如 "gold_rush_bronze"
 
         # ---- 一次性道具 / 临时状态 ----
         self.arrows: int = 0
@@ -207,3 +210,78 @@ class PlayerState:
         self.arrows = 0
         self.has_machete = False
         self.has_clover = False
+
+    # =========================================================================
+    # 局内快照（暂停菜单「重新开始本关」沙盒重置用）
+    # =========================================================================
+
+    def get_snapshot(self) -> dict:
+        """打下当前局内消耗品/状态快照（不含永久属性）。
+
+        用于暂停菜单「重新开始本关」精准还原玩家局内数据：
+        - 包含所有局内变动消耗数据（红心、护盾、金币、工具、钥匙、弓箭、柴刀、四叶草、护身符）
+        - 不含 max_hearts、bag_tier_index、生涯统计、max_shields 等全局永久属性
+
+        Returns:
+            包含全部局内可变字段的拷贝字典
+        """
+        return {
+            "current_hearts": int(self.current_hearts),
+            "current_shields": int(self.current_shields),
+            "gold": int(self.gold),
+            "tools": {
+                "pickaxe": int(self.tools.get("pickaxe", 0)),
+                "dynamite": int(self.tools.get("dynamite", 0)),
+                "map": int(self.tools.get("map", 0)),
+            },
+            "keys": {
+                "RED": int(self.keys.get("RED", 0)),
+                "GREEN": int(self.keys.get("GREEN", 0)),
+                "BLUE": int(self.keys.get("BLUE", 0)),
+                "EXIT": int(self.keys.get("EXIT", 0)),
+            },
+            "arrows": int(self.arrows),
+            "has_machete": bool(self.has_machete),
+            "has_clover": bool(self.has_clover),
+            "has_amulet": bool(self.has_amulet),
+        }
+
+    def load_snapshot(self, snapshot_dict: dict) -> None:
+        """从快照字典还原全部局内可变字段（原地写回）。
+
+        用于「重新开始本关」安全重置：先由调用方调用 load_snapshot
+        还原玩家数据，再重载地图、重连控制器。
+
+        Args:
+            snapshot_dict: get_snapshot() 返回的字典
+        """
+        if not isinstance(snapshot_dict, dict):
+            return
+
+        # 红心 / 护盾 / 金币 / 弓箭
+        self.current_hearts = int(snapshot_dict.get("current_hearts", self.current_hearts))
+        self.current_shields = int(snapshot_dict.get("current_shields", self.current_shields))
+        self.gold = int(snapshot_dict.get("gold", self.gold))
+        self.arrows = int(snapshot_dict.get("arrows", self.arrows))
+
+        # 工具（整体重建字典，避免旧引用残留）
+        tools_raw = snapshot_dict.get("tools", {})
+        self.tools = {
+            "pickaxe": int(tools_raw.get("pickaxe", 0)),
+            "dynamite": int(tools_raw.get("dynamite", 0)),
+            "map": int(tools_raw.get("map", 0)),
+        }
+
+        # 钥匙（整体重建字典）
+        keys_raw = snapshot_dict.get("keys", {})
+        self.keys = {
+            "RED": int(keys_raw.get("RED", 0)),
+            "GREEN": int(keys_raw.get("GREEN", 0)),
+            "BLUE": int(keys_raw.get("BLUE", 0)),
+            "EXIT": int(keys_raw.get("EXIT", 0)),
+        }
+
+        # 布尔状态
+        self.has_machete = bool(snapshot_dict.get("has_machete", self.has_machete))
+        self.has_clover = bool(snapshot_dict.get("has_clover", self.has_clover))
+        self.has_amulet = bool(snapshot_dict.get("has_amulet", self.has_amulet))

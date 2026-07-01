@@ -178,9 +178,16 @@ def test_main_menu_on_enter_buttons_initialized():
 
     assert screen.btn_new_game is not None, "开始新游戏按钮应存在"
     assert screen.btn_continue is not None, "读取进度按钮应存在"
+    assert screen.btn_achievements is not None, "荣誉成就按钮应存在"
     assert screen.btn_settings is not None, "设置按钮应存在"
+    assert screen.btn_custom is not None, "自定义关卡按钮应存在"
+    assert screen.btn_save_slots is not None, "选择存档槽按钮应存在"
+    assert screen.btn_map_editor is not None, "设计地图按钮应存在"
     assert screen.btn_quit is not None, "退出游戏按钮应存在"
-    assert len(screen.buttons) == 4, "应包含 4 个按钮（新游戏/继续/设置/退出）"
+    # 第 57 课：新增「设计地图」按钮，总数由 7 升至 8
+    assert len(screen.buttons) == 8, (
+        "应包含 8 个按钮（新游戏/继续/荣誉成就/设置/设计地图/自定义关卡/选择存档槽/退出）"
+    )
 
     assert screen.sound_hover is not None, "悬停音效应已加载"
     assert screen.sound_click is not None, "点击音效应已加载"
@@ -458,11 +465,16 @@ def test_main_menu_on_exit_clears_refs():
 
     assert screen.game_manager is None
     assert screen.buttons == []
-    assert screen.btn_new_game is None
-    assert screen.btn_continue is None
-    assert screen.btn_quit is None
-    assert screen.sound_hover is None
-    assert screen.sound_click is None
+    assert screen.btn_new_game is None, "on_exit 应清理 btn_new_game"
+    assert screen.btn_continue is None, "on_exit 应清理 btn_continue"
+    assert screen.btn_achievements is None, "on_exit 应清理 btn_achievements"
+    assert screen.btn_settings is None, "on_exit 应清理 btn_settings"
+    assert screen.btn_map_editor is None, "on_exit 应清理 btn_map_editor"
+    assert screen.btn_custom is None, "on_exit 应清理 btn_custom"
+    assert screen.btn_save_slots is None, "on_exit 应清理 btn_save_slots"
+    assert screen.btn_quit is None, "on_exit 应清理 btn_quit"
+    assert screen.sound_hover is None, "on_exit 应清理 sound_hover"
+    assert screen.sound_click is None, "on_exit 应清理 sound_click"
 
     print("[PASS] test_main_menu_on_exit_clears_refs")
 
@@ -482,6 +494,124 @@ def test_main_menu_render_no_exception():
     screen.render(surface)
 
     print("[PASS] test_main_menu_render_no_exception")
+
+
+# ==========================================================================
+# 第 54 课新增：主菜单「自定义关卡」按钮相关测试
+# ==========================================================================
+
+
+def test_main_menu_custom_button_greyed_out_when_missing():
+    """无 custom_map.json 时，自定义关卡按钮应置灰（is_enabled=False）。"""
+    GameManager._instance = None
+    AssetManager._instance = None
+    gm = GameManager.get_instance()
+    gm.init_engine(headless=True)
+
+    screen = MainMenuScreen()
+    gm.screen_manager.register_screen(GameState.MAIN_MENU, screen)
+    gm.screen_manager.switch_screen(GameState.MAIN_MENU)
+
+    # 当前测试沙盒根目录不放置 custom_map.json → 按钮必须置灰
+    assert screen.btn_custom is not None, "自定义关卡按钮应始终创建"
+    assert screen.btn_custom.is_enabled is False, (
+        "无 custom_map.json 时自定义关卡按钮应置灰"
+    )
+
+    # 渲染不应崩溃
+    surface = pygame.Surface((SCREEN_WIDTH, SCREEN_HEIGHT))
+    screen.render(surface)
+
+    print("[PASS] test_main_menu_custom_button_greyed_out_when_missing")
+
+
+def test_main_menu_custom_button_enabled_when_present(monkeypatch=None):
+    """mock os.path.exists 返回 True 时，自定义关卡按钮应启用。"""
+    import os as _os
+
+    GameManager._instance = None
+    AssetManager._instance = None
+    gm = GameManager.get_instance()
+    gm.init_engine(headless=True)
+
+    # mock os.path.exists 强制返回 True
+    _original_exists = _os.path.exists
+    _os.path.exists = lambda p: True if p.endswith("custom_map.json") else _original_exists(p)
+    try:
+        screen = MainMenuScreen()
+        gm.screen_manager.register_screen(GameState.MAIN_MENU, screen)
+        gm.screen_manager.switch_screen(GameState.MAIN_MENU)
+
+        assert screen.btn_custom is not None, "自定义关卡按钮应始终创建"
+        assert screen.btn_custom.is_enabled is True, (
+            "根目录有 custom_map.json 时自定义关卡按钮应启用"
+        )
+    finally:
+        _os.path.exists = _original_exists
+
+    print("[PASS] test_main_menu_custom_button_enabled_when_present")
+
+
+def test_main_menu_custom_button_click_routes_to_playing():
+    """点击「自定义关卡」应切换到 PLAYING 场景并传 custom_map_path payload。"""
+    import os as _os
+
+    GameManager._instance = None
+    AssetManager._instance = None
+    gm = GameManager.get_instance()
+    gm.init_engine(headless=True)
+
+    _original_exists = _os.path.exists
+    _os.path.exists = lambda p: True if p.endswith("custom_map.json") else _original_exists(p)
+    try:
+        screen = MainMenuScreen()
+        gm.screen_manager.register_screen(GameState.MAIN_MENU, screen)
+
+        class MockPlaying(BaseScreen):
+            def __init__(self):
+                self.enter_payload = None
+            def on_enter(self, data_payload=None):
+                self.enter_payload = data_payload
+            def on_exit(self): pass
+            def handle_event(self, event): pass
+            def update(self, dt): pass
+            def render(self, surface): pass
+
+        class MockSettings(BaseScreen):
+            def __init__(self): pass
+            def on_enter(self, data_payload=None): pass
+            def on_exit(self): pass
+            def handle_event(self, event): pass
+            def update(self, dt): pass
+            def render(self, surface): pass
+
+        mock_playing = MockPlaying()
+        mock_settings = MockSettings()
+        gm.screen_manager.register_screen(GameState.PLAYING, mock_playing)
+        gm.screen_manager.register_screen(GameState.SETTINGS, mock_settings)
+        gm.screen_manager.register_screen(GameState.STATS, MockSettings())
+        gm.screen_manager.register_screen(GameState.SAVE_SLOT_SELECT, MockSettings())
+        gm.screen_manager.switch_screen(GameState.MAIN_MENU)
+
+        class MockSound:
+            def play(self, *a, **kw): pass
+        screen.sound_click = MockSound()
+
+        btn = screen.btn_custom
+        assert btn.is_enabled is True, "已 mock 文件存在，按钮应启用"
+        click_event = pygame.event.Event(
+            pygame.MOUSEBUTTONDOWN,
+            {"button": 1, "pos": btn.rect.center},
+        )
+        screen.handle_event(click_event)
+
+        assert mock_playing.enter_payload == {"custom_map_path": "custom_map.json"}, (
+            f"自定义关卡应传 custom_map_path payload，得到 {mock_playing.enter_payload}"
+        )
+    finally:
+        _os.path.exists = _original_exists
+
+    print("[PASS] test_main_menu_custom_button_click_routes_to_playing")
 
 
 # --------------------------------------------------------------------------
@@ -506,6 +636,9 @@ if __name__ == "__main__":
         test_main_menu_disabled_continue_not_clickable()
         test_main_menu_on_exit_clears_refs()
         test_main_menu_render_no_exception()
+        test_main_menu_custom_button_greyed_out_when_missing()
+        test_main_menu_custom_button_enabled_when_present()
+        test_main_menu_custom_button_click_routes_to_playing()
 
         print("\n=== ALL TESTS PASSED ===")
     finally:

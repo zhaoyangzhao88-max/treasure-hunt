@@ -9,6 +9,33 @@ import pygame
 
 
 # =============================================================================
+# 自愈路径解析器 — 兼容开发态与 PyInstaller 打包态
+# =============================================================================
+
+def get_resource_path(relative_path: str) -> str:
+    """获取资源的绝对路径，兼容开发调试环境与 PyInstaller 单文件打包运行环境。
+
+    在源码开发态下，基于当前工作目录拼接相对路径；
+    在 PyInstaller 打包运行态下（``sys.frozen == True`` 且存在 ``sys._MEIPASS``），
+    自动重定向至解压临时目录 ``_MEIPASS``，确保资产可被正确加载。
+
+    Args:
+        relative_path: 相对于项目根目录的资源路径（如 ``"assets/images/hero.png"``）。
+
+    Returns:
+        资源的绝对路径字符串。
+    """
+    import sys
+    if getattr(sys, 'frozen', False) and hasattr(sys, '_MEIPASS'):
+        # 处于 PyInstaller 打包运行态下 — 资源被解压到临时目录 _MEIPASS
+        base_path = sys._MEIPASS
+    else:
+        # 处于普通 Python 源码运行态下 — 基于当前工作目录
+        base_path = os.path.abspath(".")
+    return os.path.join(base_path, relative_path)
+
+
+# =============================================================================
 # 哑音类 — Pygame Sound 的静默替代品
 # =============================================================================
 
@@ -86,7 +113,7 @@ class AssetManager:
         if cache_key in self._images:
             return self._images[cache_key]
 
-        full_path = os.path.join(self.root, "images", rel_path)
+        full_path = get_resource_path(os.path.join("assets", "images", rel_path))
 
         try:
             surface = pygame.image.load(full_path)
@@ -130,7 +157,7 @@ class AssetManager:
             self._sounds[cache_key] = sound
             return sound
 
-        full_path = os.path.join(self.root, "sounds", rel_path)
+        full_path = get_resource_path(os.path.join("assets", "sounds", rel_path))
 
         try:
             sound = pygame.mixer.Sound(full_path)
@@ -180,9 +207,9 @@ class AssetManager:
 
         # 尝试加载字体文件（或系统字体名）
         font_paths_to_try = [
-            os.path.join(self.root, "fonts", font_name),
-            os.path.join(self.root, "fonts", font_name + ".ttf"),
-            os.path.join(self.root, "fonts", font_name + ".otf"),
+            get_resource_path(os.path.join("assets", "fonts", font_name)),
+            get_resource_path(os.path.join("assets", "fonts", font_name + ".ttf")),
+            get_resource_path(os.path.join("assets", "fonts", font_name + ".otf")),
         ]
 
         font = None
@@ -196,9 +223,17 @@ class AssetManager:
 
         if font is None:
             print(f"WARNING: Failed to load font '{font_name}', falling back to built-in font.")
-            # NOTE: pygame 2.6.1 on Windows has a bug in SysFont() font scanning;
-            #       use Font(None) to get the built-in freesansbold font instead.
-            font = pygame.font.Font(None, size)
+            # 级联降级策略，优先使用通用系统字体，规避 None 默认字体在打包态下渲染为空白的 Bug
+            try:
+                # 1. 优先尝试加载系统自带的 Arial 字体（跨平台通用）
+                font = pygame.font.SysFont("arial", size)
+            except Exception:
+                try:
+                    # 2. 备选尝试加载中文字符集友好的微软雅黑字体
+                    font = pygame.font.SysFont("microsoftyahei", size)
+                except Exception:
+                    # 3. 最终无路可退时使用内置字体兜底
+                    font = pygame.font.SysFont(None, size)
 
         self._fonts[cache_key] = font
         return font
